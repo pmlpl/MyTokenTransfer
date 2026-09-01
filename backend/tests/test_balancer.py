@@ -1,4 +1,4 @@
-"""池内密钥选择：gateway._ordered_keys 的单测。
+"""池内密钥选择：gateway.ordered_keys 的单测。
 
 验证故障转移的"自动跳过不可用 key"语义——exhausted/invalid/rate_limited 的 key
 不会被选中，请求自动落到下一个可用账号。这是方案 §3.3 的核心。
@@ -11,7 +11,7 @@ from sqlalchemy import select
 
 from app.models import ApiKey, Channel, ChannelKey, ChannelTier, Provider
 from app.models.enums import KeyStrategy, KeyStatus
-from app.relay.gateway import _now, _ordered_keys
+from app.relay.balancer import now_utc, ordered_keys
 
 
 async def _make_tier_with_keys(db, channel, provider, *specs: tuple[KeyStatus, int, int | None]):
@@ -70,7 +70,7 @@ async def test_skips_non_active_keys(db_session):
         (KeyStatus.disabled, 1, 0),
     )
 
-    chosen = await _ordered_keys(tier, KeyStrategy.round_robin, db)
+    chosen = await ordered_keys(tier, KeyStrategy.round_robin, db)
     assert len(chosen) == 1
     assert chosen[0].id == keys[0].id
 
@@ -87,10 +87,10 @@ async def test_rate_limited_future_cooldown_skipped(db_session):
     )
     # 把第二个 active key 标成限流且冷却未到期
     keys[1].status = KeyStatus.rate_limited
-    keys[1].rate_limited_until = _now() + timedelta(hours=1)
+    keys[1].rate_limited_until = now_utc() + timedelta(hours=1)
     await db.commit()
 
-    chosen = await _ordered_keys(tier, KeyStrategy.round_robin, db)
+    chosen = await ordered_keys(tier, KeyStrategy.round_robin, db)
     assert len(chosen) == 1
     assert chosen[0].id == keys[0].id
 
@@ -106,7 +106,7 @@ async def test_round_robin_is_id_order(db_session):
         (KeyStatus.active, 1, 0),
     )
 
-    chosen = await _ordered_keys(tier, KeyStrategy.round_robin, db)
+    chosen = await ordered_keys(tier, KeyStrategy.round_robin, db)
     assert [k.id for k in chosen] == [keys[0].id, keys[1].id, keys[2].id]
 
 
@@ -122,7 +122,7 @@ async def test_priority_strategy(db_session):
         (KeyStatus.active, 1, 5),   # 中
     )
 
-    chosen = await _ordered_keys(tier, KeyStrategy.priority, db)
+    chosen = await ordered_keys(tier, KeyStrategy.priority, db)
     assert [k.id for k in chosen] == [keys[1].id, keys[2].id, keys[0].id]
 
 
@@ -138,7 +138,7 @@ async def test_weighted_covers_all_active(db_session):
         (KeyStatus.active, 1, 0),
     )
 
-    chosen = await _ordered_keys(tier, KeyStrategy.weighted, db)
+    chosen = await ordered_keys(tier, KeyStrategy.weighted, db)
     assert set(k.id for k in chosen) == {keys[0].id, keys[1].id, keys[2].id}
 
 
@@ -151,5 +151,5 @@ async def test_empty_tier_returns_empty(db_session):
     db.add(tier)
     await db.commit()
 
-    chosen = await _ordered_keys(tier, KeyStrategy.round_robin, db)
+    chosen = await ordered_keys(tier, KeyStrategy.round_robin, db)
     assert chosen == []

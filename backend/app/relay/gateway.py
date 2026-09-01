@@ -1,185 +1,30 @@
+"""转发网关 HTTP 编排层。
+
+把请求拆成有序的 (tier, key) 尝试序列（balancer 负责），逐个发上游，
+命中可恢复错误就标状态并换下一个、整池失败沿 Tier 链兜底，
+成功/失败都让 accounting 写 CallLog。流式响应中途出错不再切换。
+"""
 from __future__ import annotations
 
 import asyncio
 import json
 import time
-from datetime import datetime, timezone
-from typing import Any
 
 import httpx
 from fastapi.responses import JSONResponse, StreamingResponse
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import decrypt_value
-from app.database import AsyncSessionLocal
-from app.models import ApiKey, CallLog, Channel, ChannelKey, ChannelTier, KeyStatus, ModelMapping
-from app.models.enums import KeyStrategy, ProbeKind
-from app.services.health_check import _DEFAULT_BASES, _join
-
-_RATE_LIMIT_COOLDOWN = 60
-
-
-def _now() -> datetime:
-    return datetime.now(timezone.utc).replace(tzinfo=None)
-
-
-def _base_url(provider) -> str:
-    return provider.base_url or _DEFAULT_BASES.get(provider.slug, "")
-
-
-async def _resolve_native(virtual_model: str, provider_id: int, db: AsyncSession) -> str:
-    mm = await db.scalar(
-        select(ModelMapping).where(
-            ModelMapping.virtual_model == virtual_model, ModelMapping.provider_id == provider_id
-        )
-    )
-    return mm.native_model if mm else virtual_model
-
-
-async def _ordered_keys(tier: ChannelTier, strategy: KeyStrategy, db: AsyncSession) -> list[ApiKey]:
-    """层内按策略排序的可用密钥（跳过非 active / 限流冷却中）。"""
-    rows = await db.execute(select(ChannelKey).where(ChannelKey.channel_tier_id == tier.id))
-    cks = list(rows.scalars())
-    pairs: list[tuple[Any, ApiKey]] = []
-    for ck in cks:
-        ak = await db.get(ApiKey, ck.key_id)
-        if not ak:
-            continue
-        if ak.status != KeyStatus.active:
-            continue
-        if ak.rate_limited_until and ak.rate_limited_until > _now():
-            continue
-        pairs.append((ck, ak))
-
-    if strategy == KeyStrategy.priority:
-        pairs.sort(key=lambda x: (-x[0].priority, x[0].id))
-    elif strategy == KeyStrategy.weighted:
-        # 按 weight 重复后打散（确定性随机）
-        import random
-
-        pool: list[tuple[Any, ApiKey]] = []
-        for p in pairs:
-            pool.extend([p] * max(1, p[0].weight))
-        random.shuffle(pool)
-        seen: set[int] = set()
-        ordered = []
-        for p in pool:
-            if p[1].id in seen:
-                continue
-            seen.add(p[1].id)
-            ordered.append(p)
-        # 补上未被随机选中的
-        for p in pairs:
-            if p[1].id not in seen:
-                ordered.append(p)
-                seen.add(p[1].id)
-        pairs = ordered
-    else:  # round_robin：稳定顺序即可，跨请求的轮转交给上游 key 状态变化
-        pairs.sort(key=lambda x: x[0].id)
-    return [p[1] for p in pairs]
-
-
-def _classify_error(status_code: int, body_text: str) -> tuple[bool, KeyStatus | None, str]:
-    """返回 (是否可重试/切换, 标记的状态, 错误描述)。"""
-    text = (body_text or "").lower()
-    if status_code in (401, 403):
-        return True, KeyStatus.invalid, f"HTTP {status_code}: {body_text[:200]}"
-    if status_code == 429:
-        # 429 里带 quota/额度关键词的是真耗尽（冷却也救不回来），标 exhausted
-        if any(k in text for k in ("quota", "entitlement", "余额", "exhausted", "insufficient")):
-            return True, KeyStatus.exhausted, f"HTTP 429 quota: {body_text[:200]}"
-        return True, KeyStatus.rate_limited, f"HTTP 429: {body_text[:200]}"
-    if status_code == 400 and any(k in text for k in ("insufficient_quota", "quota", "余额", "exceeded", "insufficient")):
-        return True, KeyStatus.exhausted, f"HTTP 400 quota: {body_text[:200]}"
-    if status_code >= 500:
-        return True, None, f"HTTP {status_code}: {body_text[:200]}"
-    # 400 等客户端错误：不可重试（请求本身有问题，换 key 也没用）
-    return False, None, f"HTTP {status_code}: {body_text[:200]}"
-
-
-async def _mark_key(
-    key: ApiKey,
-    status: KeyStatus | None,
-    db: AsyncSession,
-    *,
-    message: str | None = None,
-) -> None:
-    if status is None:
-        return
-    before = key.status
-    key.status = status
-    if status == KeyStatus.rate_limited:
-        from datetime import timedelta
-
-        key.rate_limited_until = _now() + timedelta(seconds=_RATE_LIMIT_COOLDOWN)
-    # 状态劣化到 exhausted/invalid 时写一条告警（由调用方随同 commit）
-    from app.services.alerts import emit_key_alert
-
-    await emit_key_alert(
-        db,
-        key_id=key.id,
-        provider_id=key.provider_id,
-        key_name=key.name,
-        before=before,
-        after=status,
-        message=message or "上游请求失败",
-    )
-    await db.commit()
-
-
-async def _write_log(
-    *,
-    channel_id: int | None,
-    tier_order: int | None,
-    provider_id: int | None,
-    key_id: int | None,
-    virtual_model: str | None,
-    native_model: str | None,
-    usage: dict | None,
-    latency_ms: int,
-    status: str,
-    error: str | None,
-    stream: bool,
-) -> None:
-    """用独立会话写调用日志（流式时主会话已关闭）。按价表算 cost。"""
-    from app.models import ModelPricing  # 局部导入避免循环
-
-    u = usage or {}
-    pt = int(u.get("prompt_tokens", 0) or 0)
-    ct = int(u.get("completion_tokens", 0) or 0)
-    async with AsyncSessionLocal() as s:
-        cost = 0.0
-        model_for_price = native_model or virtual_model
-        if model_for_price and (pt or ct):
-            p = await s.scalar(
-                select(ModelPricing).where(ModelPricing.model_name == model_for_price)
-            )
-            if p is not None:
-                cost = round(
-                    pt * float(p.input_price) / 1_000_000 + ct * float(p.output_price) / 1_000_000,
-                    6,
-                )
-        s.add(
-            CallLog(
-                created_at=_now(),
-                channel_id=channel_id,
-                tier_order=tier_order,
-                provider_id=provider_id,
-                key_id=key_id,
-                virtual_model=virtual_model,
-                native_model=native_model,
-                prompt_tokens=pt,
-                completion_tokens=ct,
-                total_tokens=int(u.get("total_tokens", 0) or 0),
-                cost=cost,
-                latency_ms=latency_ms,
-                status=status,
-                error=(error[:500] if error else None),
-                stream=stream,
-            )
-        )
-        await s.commit()
+from app.models import ApiKey, Channel, ChannelTier, KeyStatus
+from app.relay.accounting import write_call_log
+from app.relay.balancer import (
+    base_url_for,
+    classify_error,
+    mark_key,
+    ordered_keys,
+    resolve_native,
+)
+from app.services.health_check import _join
 
 
 def _build_payload(body: dict, native_model: str, stream: bool) -> dict:
@@ -197,31 +42,39 @@ def _headers(raw_key: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {raw_key}", "Content-Type": "application/json"}
 
 
+async def _build_attempts(channel: Channel, db: AsyncSession) -> list[tuple[ChannelTier, ApiKey]]:
+    """按 Tier 升序，每层取策略排序后的可用 key（受 max_retries 限）。"""
+    max_retries = max(1, channel.max_retries)
+    tiers = sorted(channel.tiers, key=lambda t: t.order)
+    attempts: list[tuple[ChannelTier, ApiKey]] = []
+    for tier in tiers:
+        keys = await ordered_keys(tier, channel.strategy, db)
+        for k in keys[:max_retries]:
+            attempts.append((tier, k))
+    return attempts
+
+
+def _no_key_response() -> JSONResponse:
+    return JSONResponse(
+        status_code=503,
+        content={"error": {"message": "无可用密钥（全部失效/限流）", "type": "no_available_key"}},
+    )
+
+
 async def route_chat_completions(
     channel: Channel, body: dict, db: AsyncSession
 ) -> JSONResponse | StreamingResponse:
     virtual = channel.virtual_model
     stream = bool(body.get("stream"))
-    max_retries = max(1, channel.max_retries)
 
-    # 构建尝试序列：按 tier.order 升序，每层按策略排序的可用 key
-    tiers = sorted(channel.tiers, key=lambda t: t.order)
-    attempts: list[tuple[ChannelTier, ApiKey]] = []
-    for tier in tiers:
-        keys = await _ordered_keys(tier, channel.strategy, db)
-        for k in keys[:max_retries]:
-            attempts.append((tier, k))
-
+    attempts = await _build_attempts(channel, db)
     if not attempts:
-        return JSONResponse(
-            status_code=503,
-            content={"error": {"message": "无可用密钥（全部失效/限流）", "type": "no_available_key"}},
-        )
+        return _no_key_response()
 
     last_error = "无可用上游"
     for tier, key in attempts:
-        native = await _resolve_native(virtual, tier.provider_id, db)
-        base = _base_url(tier.provider)
+        native = await resolve_native(virtual, tier.provider_id, db)
+        base = base_url_for(tier.provider)
         if not base:
             last_error = f"供应商 {tier.provider.slug} 缺少 base_url"
             continue
@@ -229,7 +82,7 @@ async def route_chat_completions(
         try:
             raw = decrypt_value(key.key_value)
         except Exception:
-            await _mark_key(key, KeyStatus.invalid, db, message="密文解密失败")
+            await mark_key(key, KeyStatus.invalid, db, message="密文解密失败")
             continue
 
         payload = _build_payload(body, native, stream)
@@ -249,8 +102,8 @@ async def route_chat_completions(
                 err_text = response.text
                 await response.aclose()
                 await client.aclose()
-                retry, mark, msg = _classify_error(response.status_code, err_text)
-                await _mark_key(key, mark, db, message=msg)
+                retry, mark, msg = classify_error(response.status_code, err_text)
+                await mark_key(key, mark, db, message=msg)
                 last_error = msg
                 if retry:
                     continue
@@ -281,7 +134,7 @@ async def route_chat_completions(
             latency_ms = int((time.time() - t0) * 1000)
             if resp.status_code == 200:
                 data = resp.json()
-                await _write_log(
+                await write_call_log(
                     channel_id=channel.id,
                     tier_order=tier.order,
                     provider_id=tier.provider_id,
@@ -295,9 +148,9 @@ async def route_chat_completions(
                     stream=False,
                 )
                 return JSONResponse(status_code=200, content=data)
-            retry, mark, msg = _classify_error(resp.status_code, resp.text)
-            await _mark_key(key, mark, db, message=msg)
-            await _write_log(
+            retry, mark, msg = classify_error(resp.status_code, resp.text)
+            await mark_key(key, mark, db, message=msg)
+            await write_call_log(
                 channel_id=channel.id,
                 tier_order=tier.order,
                 provider_id=tier.provider_id,
@@ -355,7 +208,7 @@ async def _stream_passthrough(client: httpx.AsyncClient, response: httpx.Respons
         latency_ms = int((time.time() - meta["t0"]) * 1000)
         # 用独立任务写日志：即使客户端中途断开导致生成器被取消，日志也能落库
         asyncio.create_task(
-            _write_log(
+            write_call_log(
                 channel_id=meta["channel_id"],
                 tier_order=meta["tier_order"],
                 provider_id=meta["provider_id"],
@@ -377,25 +230,15 @@ async def route_embeddings(channel: Channel, body: dict, db: AsyncSession) -> JS
     与 chat 不同的是：embeddings 不支持流式，响应 usage 仅含 prompt/total tokens。
     """
     virtual = channel.virtual_model
-    max_retries = max(1, channel.max_retries)
 
-    tiers = sorted(channel.tiers, key=lambda t: t.order)
-    attempts: list[tuple[ChannelTier, ApiKey]] = []
-    for tier in tiers:
-        keys = await _ordered_keys(tier, channel.strategy, db)
-        for k in keys[:max_retries]:
-            attempts.append((tier, k))
-
+    attempts = await _build_attempts(channel, db)
     if not attempts:
-        return JSONResponse(
-            status_code=503,
-            content={"error": {"message": "无可用密钥（全部失效/限流）", "type": "no_available_key"}},
-        )
+        return _no_key_response()
 
     last_error = "无可用上游"
     for tier, key in attempts:
-        native = await _resolve_native(virtual, tier.provider_id, db)
-        base = _base_url(tier.provider)
+        native = await resolve_native(virtual, tier.provider_id, db)
+        base = base_url_for(tier.provider)
         if not base:
             last_error = f"供应商 {tier.provider.slug} 缺少 base_url"
             continue
@@ -403,7 +246,7 @@ async def route_embeddings(channel: Channel, body: dict, db: AsyncSession) -> JS
         try:
             raw = decrypt_value(key.key_value)
         except Exception:
-            await _mark_key(key, KeyStatus.invalid, db, message="密文解密失败")
+            await mark_key(key, KeyStatus.invalid, db, message="密文解密失败")
             continue
 
         # embeddings 不支持 stream，仅透传 model 与 input 等参数
@@ -419,7 +262,7 @@ async def route_embeddings(channel: Channel, body: dict, db: AsyncSession) -> JS
         latency_ms = int((time.time() - t0) * 1000)
         if resp.status_code == 200:
             data = resp.json()
-            await _write_log(
+            await write_call_log(
                 channel_id=channel.id,
                 tier_order=tier.order,
                 provider_id=tier.provider_id,
@@ -433,9 +276,9 @@ async def route_embeddings(channel: Channel, body: dict, db: AsyncSession) -> JS
                 stream=False,
             )
             return JSONResponse(status_code=200, content=data)
-        retry, mark, msg = _classify_error(resp.status_code, resp.text)
-        await _mark_key(key, mark, db, message=msg)
-        await _write_log(
+        retry, mark, msg = classify_error(resp.status_code, resp.text)
+        await mark_key(key, mark, db, message=msg)
+        await write_call_log(
             channel_id=channel.id,
             tier_order=tier.order,
             provider_id=tier.provider_id,
