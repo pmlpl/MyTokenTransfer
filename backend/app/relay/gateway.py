@@ -20,11 +20,11 @@ from app.models import ApiKey, Channel, ChannelTier, KeyStatus
 from app.relay.accounting import write_call_log
 from app.relay.balancer import (
     base_url_for,
-    classify_error,
     mark_key,
     ordered_keys,
     resolve_native,
 )
+from app.relay.errors import classify_error
 from app.services.health_check import _join
 
 log = structlog.get_logger("relay")

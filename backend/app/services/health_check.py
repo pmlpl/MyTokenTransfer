@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.security import decrypt_value
 from app.models import ApiKey, KeyStatus, Provider
 from app.models.enums import ProbeKind
+from app.relay.errors import classify_error
 
 # 各供应商默认基址（provider.base_url 为空时兜底）
 _DEFAULT_BASES = {
@@ -32,6 +33,7 @@ class ProbeResult:
     balance: str | None
     error: str | None
     via: str = "models"  # models=列模型接口 / chat=最小对话兜底
+    body: str | None = None  # 上游响应正文片段（供 classify_error 判 quota 关键词）
 
 
 def _join(base: str, path: str) -> str:
@@ -63,7 +65,9 @@ async def _probe_models(base: str, headers: dict[str, str]) -> ProbeResult | Non
     if resp.status_code in (404, 400, 405, 501):
         return None  # 供应商未开放列模型接口（如 SenseNova 兼容模式）
     snippet = resp.text[:200] if resp.text else ""
-    return ProbeResult(False, resp.status_code, None, f"HTTP {resp.status_code}: {snippet}")
+    return ProbeResult(
+        False, resp.status_code, None, f"HTTP {resp.status_code}: {snippet}", body=snippet
+    )
 
 
 async def _probe_chat(base: str, headers: dict[str, str], model: str) -> ProbeResult:
@@ -86,7 +90,9 @@ async def _probe_chat(base: str, headers: dict[str, str], model: str) -> ProbeRe
     if resp.status_code == 200:
         return ProbeResult(True, 200, None, None, via="chat")
     snippet = resp.text[:200] if resp.text else ""
-    return ProbeResult(False, resp.status_code, None, f"HTTP {resp.status_code}: {snippet}", via="chat")
+    return ProbeResult(
+        False, resp.status_code, None, f"HTTP {resp.status_code}: {snippet}", via="chat", body=snippet
+    )
 
 
 async def _probe(provider: Provider, raw_key: str) -> ProbeResult:
@@ -123,10 +129,12 @@ async def _probe(provider: Provider, raw_key: str) -> ProbeResult:
                 resp = await client.get(url)
         except Exception as e:
             return ProbeResult(False, None, None, f"{type(e).__name__}: {e}")
-        if resp.status_code == 200:
-            return ProbeResult(True, 200, None, None)
-        snippet = resp.text[:200] if resp.text else ""
-        return ProbeResult(False, resp.status_code, None, f"HTTP {resp.status_code}: {snippet}")
+    if resp.status_code == 200:
+        return ProbeResult(True, 200, None, None)
+    snippet = resp.text[:200] if resp.text else ""
+    return ProbeResult(
+        False, resp.status_code, None, f"HTTP {resp.status_code}: {snippet}", body=snippet
+    )
 
     return ProbeResult(False, None, None, "不支持的探测方式")
 
@@ -134,19 +142,26 @@ async def _probe(provider: Provider, raw_key: str) -> ProbeResult:
 def _classify(
     result: ProbeResult, current: KeyStatus
 ) -> tuple[KeyStatus, str | None, datetime | None]:
-    """根据探针结果决定新状态/错误/冷却到期。"""
+    """根据探针结果决定新状态/错误/冷却到期。
+
+    复用 relay.errors.classify_error，与健康路径保持一致：
+    429 带 quota 关键词 → exhausted（额度用尽，靠巡检恢复，不设冷却）；
+    纯 429 → rate_limited + 短冷却；401/403 → invalid。
+    """
     now = _now()
     if result.ok:
         return KeyStatus.active, None, None
+    if result.http_status is None:
+        # 网络层/配置错误：瞬时，保留原状态，记录原始错误
+        return current, result.error, None
 
-    sc = result.http_status
-    err = result.error
-    if sc in (401, 403):
-        return KeyStatus.invalid, err, None
-    if sc == 429:
-        return KeyStatus.rate_limited, err, now + timedelta(seconds=_RATE_LIMIT_COOLDOWN)
-    # 5xx / 超时 / 未知：视为瞬时，保留原状态，仅记录错误
-    return current, err, None
+    _retry, status, msg = classify_error(result.http_status, result.body or "")
+    if status == KeyStatus.rate_limited:
+        return status, msg, now + timedelta(seconds=_RATE_LIMIT_COOLDOWN)
+    if status is not None:
+        return status, msg, None
+    # 5xx/未知：保留原状态，仅记录错误
+    return current, msg, None
 
 
 def _now() -> datetime:

@@ -84,24 +84,6 @@ async def ordered_keys(tier: ChannelTier, strategy: KeyStrategy, db: AsyncSessio
     return [p[1] for p in pairs]
 
 
-def classify_error(status_code: int, body_text: str) -> tuple[bool, KeyStatus | None, str]:
-    """返回 (是否可重试/切换, 标记的状态, 错误描述)。"""
-    text = (body_text or "").lower()
-    if status_code in (401, 403):
-        return True, KeyStatus.invalid, f"HTTP {status_code}: {body_text[:200]}"
-    if status_code == 429:
-        # 429 里带 quota/额度关键词的是真耗尽（冷却也救不回来），标 exhausted
-        if any(k in text for k in ("quota", "entitlement", "余额", "exhausted", "insufficient")):
-            return True, KeyStatus.exhausted, f"HTTP 429 quota: {body_text[:200]}"
-        return True, KeyStatus.rate_limited, f"HTTP 429: {body_text[:200]}"
-    if status_code == 400 and any(k in text for k in ("insufficient_quota", "quota", "余额", "exceeded", "insufficient")):
-        return True, KeyStatus.exhausted, f"HTTP 400 quota: {body_text[:200]}"
-    if status_code >= 500:
-        return True, None, f"HTTP {status_code}: {body_text[:200]}"
-    # 400 等客户端错误：不可重试（请求本身有问题，换 key 也没用）
-    return False, None, f"HTTP {status_code}: {body_text[:200]}"
-
-
 async def mark_key(
     key: ApiKey,
     status: KeyStatus | None,

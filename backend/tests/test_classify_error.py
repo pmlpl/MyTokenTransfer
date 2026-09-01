@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from app.models.enums import KeyStatus
-from app.relay.balancer import classify_error
+from app.relay.errors import classify_error
 
 
 def test_auth_error_marks_invalid_and_retryable():
