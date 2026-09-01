@@ -13,6 +13,8 @@
       </el-select>
       <el-button type="primary" :loading="testing" @click="onBatchTest">批量健康测试</el-button>
       <div style="flex: 1" />
+      <el-button @click="openExport">导出备份</el-button>
+      <el-button @click="openImport">导入备份</el-button>
       <el-button type="success" @click="openAdd">新增密钥</el-button>
     </div>
 
@@ -86,6 +88,33 @@
       <template #footer>
         <el-button @click="dialog.visible = false">取消</el-button>
         <el-button type="primary" :loading="dialog.saving" @click="onSave">保存</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 导出/导入对话框 -->
+    <el-dialog v-model="bundleDialog.visible" :title="bundleDialog.mode === 'export' ? '导出备份' : '导入备份'" width="480px">
+      <el-form label-width="90px">
+        <el-form-item label="加密口令">
+          <el-input
+            v-model="bundleDialog.password"
+            type="password"
+            show-password
+            :placeholder="bundleDialog.mode === 'export' ? '用于加密导出包（导入时需一致）' : '导出时设置的口令'"
+          />
+        </el-form-item>
+        <el-form-item v-if="bundleDialog.mode === 'import'" label="备份文件">
+          <input ref="fileInput" type="file" accept=".json" @change="onFilePick" />
+        </el-form-item>
+      </el-form>
+      <div style="color: #999; font-size: 12px; line-height: 1.6">
+        导出包用该口令加密（口令不落库），包含全部供应商/分组/密钥明文，请妥善保管。<br />
+        导入按名称调谐：已存在同名密钥跳过，缺失的补建。
+      </div>
+      <template #footer>
+        <el-button @click="bundleDialog.visible = false">取消</el-button>
+        <el-button type="primary" :loading="bundleDialog.saving" @click="onBundleSubmit">
+          {{ bundleDialog.mode === 'export' ? '导出' : '导入' }}
+        </el-button>
       </template>
     </el-dialog>
   </div>
@@ -241,6 +270,76 @@ async function onBatchTest() {
     // 拦截器已提示
   } finally {
     testing.value = false
+  }
+}
+
+// ---- 导出/导入 ----
+const fileInput = ref<HTMLInputElement | null>(null)
+const bundleDialog = reactive<{
+  visible: boolean
+  mode: 'export' | 'import'
+  password: string
+  saving: boolean
+}>({ visible: false, mode: 'export', password: '', saving: false })
+let pickedBundle: Record<string, unknown> | null = null
+
+function openExport() {
+  bundleDialog.mode = 'export'
+  bundleDialog.password = ''
+  bundleDialog.visible = true
+}
+
+function openImport() {
+  bundleDialog.mode = 'import'
+  bundleDialog.password = ''
+  pickedBundle = null
+  bundleDialog.visible = true
+}
+
+function onFilePick(e: Event) {
+  const file = (e.target as HTMLInputElement).files?.[0]
+  if (!file) return
+  file
+    .text()
+    .then((text) => {
+      pickedBundle = JSON.parse(text)
+    })
+    .catch(() => {
+      ElMessage.error('备份文件不是合法 JSON')
+    })
+}
+
+async function onBundleSubmit() {
+  if (!bundleDialog.password) {
+    ElMessage.warning('请输入加密口令')
+    return
+  }
+  bundleDialog.saving = true
+  try {
+    if (bundleDialog.mode === 'export') {
+      const bundle = await api.keys.exportBundle(bundleDialog.password)
+      const blob = new Blob([JSON.stringify(bundle, null, 2)], { type: 'application/json' })
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `mytokentransfer-backup-${new Date().toISOString().slice(0, 10)}.json`
+      a.click()
+      URL.revokeObjectURL(url)
+      ElMessage.success('已导出（请妥善保管文件与口令）')
+    } else {
+      if (!pickedBundle) {
+        ElMessage.warning('请先选择备份文件')
+        return
+      }
+      const r = await api.keys.importBundle(bundleDialog.password, pickedBundle)
+      ElMessage.success(`导入完成：新增密钥 ${r.keys_imported}，跳过 ${r.keys_skipped}（供应商 +${r.providers} / 分组 +${r.groups}）`)
+      await load()
+    }
+    bundleDialog.visible = false
+  } catch {
+    // 拦截器已提示
+  } finally {
+    bundleDialog.saving = false
   }
 }
 

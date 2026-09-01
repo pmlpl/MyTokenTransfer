@@ -161,6 +161,15 @@ export const api = {
     test: (id: number) => client.post(`/keys/${id}/test`).then((r) => r.data),
     testBatch: (params?: { provider_id?: number; group_id?: number }) =>
       client.post('/keys/test', null, { params }).then((r) => r.data as unknown[]),
+    exportBundle: (password: string) =>
+      client.post<Record<string, unknown>>('/keys/export', { password }).then((r) => r.data),
+    importBundle: (password: string, bundle: Record<string, unknown>) =>
+      client
+        .post<{ providers: number; groups: number; keys_imported: number; keys_skipped: number }>(
+          '/keys/import',
+          { password, bundle },
+        )
+        .then((r) => r.data),
   },
   stats: {
     overview: () =>

@@ -52,3 +52,19 @@ class ApiKeyOut(BaseModel):
 class ApiKeyReveal(BaseModel):
     id: int
     key_value: str
+
+
+class ExportRequest(BaseModel):
+    password: str  # 导出包加密口令（独立于登录密码，不落库）
+
+
+class ImportRequest(BaseModel):
+    password: str
+    bundle: dict  # 导出包（encrypt_bundle 返回的结构）
+
+
+class ImportResult(BaseModel):
+    providers: int
+    groups: int
+    keys_imported: int
+    keys_skipped: int

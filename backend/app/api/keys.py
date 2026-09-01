@@ -5,11 +5,20 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import require_auth
-from app.core.security import decrypt_value, encrypt_value, mask_key
+from app.core.security import InvalidToken, decrypt_value, encrypt_value, mask_key
 from app.database import get_db
 from app.models import ApiKey, KeyStatus, Provider
-from app.schemas.api_key import ApiKeyCreate, ApiKeyOut, ApiKeyReveal, ApiKeyUpdate
+from app.schemas.api_key import (
+    ApiKeyCreate,
+    ApiKeyOut,
+    ApiKeyReveal,
+    ApiKeyUpdate,
+    ExportRequest,
+    ImportRequest,
+    ImportResult,
+)
 from app.services.health_check import test_key, test_keys
+from app.services.key import build_export_bundle, import_bundle
 
 router = APIRouter(
     prefix="/keys",
@@ -123,3 +132,23 @@ async def test_batch(
     db: AsyncSession = Depends(get_db),
 ) -> list[dict]:
     return await test_keys(db, provider_id=provider_id, group_id=group_id)
+
+
+@router.post("/export")
+async def export_keys(
+    body: ExportRequest, db: AsyncSession = Depends(get_db)
+) -> dict:
+    """导出全部供应商/分组/密钥为加密包（口令加密，明文密钥不出现在响应里）。"""
+    return await build_export_bundle(db, body.password)
+
+
+@router.post("/import", response_model=ImportResult)
+async def import_keys(
+    body: ImportRequest, db: AsyncSession = Depends(get_db)
+) -> ImportResult:
+    """导入加密包：按 slug/name 调谐，重名跳过，明文重新本地加密落库。"""
+    try:
+        stats = await import_bundle(db, body.bundle, body.password)
+    except InvalidToken:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "口令错误或导出包已损坏")
+    return ImportResult(**stats)

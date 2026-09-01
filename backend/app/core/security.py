@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hmac
+import os
 import time
 from functools import lru_cache
 
@@ -14,6 +15,35 @@ from app.config import settings
 
 # 固定盐：本地单用户场景可接受；强度来自 master/secret 本身的随机性
 _STATIC_SALT = b"mytokentransfer-static-salt"
+
+# 导出包口令派生参数（每次导出用随机盐）
+_BUNDLE_PBKDF2_ITER = 200_000
+
+
+def _derive_key(passphrase: str, salt: bytes) -> bytes:
+    kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=_BUNDLE_PBKDF2_ITER)
+    return base64.urlsafe_b64encode(kdf.derive(passphrase.encode("utf-8")))
+
+
+def encrypt_bundle(plaintext: str, passphrase: str) -> dict:
+    """用口令加密导出包：随机盐 + PBKDF2 派生 Fernet key。口令不落库。"""
+    salt = os.urandom(16)
+    key = _derive_key(passphrase, salt)
+    ct = Fernet(key).encrypt(plaintext.encode("utf-8")).decode("utf-8")
+    return {
+        "v": 1,
+        "kdf": "pbkdf2_sha256",
+        "iter": _BUNDLE_PBKDF2_ITER,
+        "salt": base64.b64encode(salt).decode("ascii"),
+        "ct": ct,
+    }
+
+
+def decrypt_bundle(bundle: dict, passphrase: str) -> str:
+    """用口令解密导出包。口令错或包损坏抛 InvalidToken/KeyError。"""
+    salt = base64.b64decode(bundle["salt"])
+    key = _derive_key(passphrase, salt)
+    return Fernet(key).decrypt(bundle["ct"].encode("utf-8")).decode("utf-8")
 
 
 @lru_cache(maxsize=1)
@@ -86,4 +116,6 @@ __all__ = [
     "create_session_token",
     "verify_session_token",
     "InvalidToken",
+    "encrypt_bundle",
+    "decrypt_bundle",
 ]
