@@ -49,8 +49,8 @@ uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
 ### 3. 前端
 ```bash
 cd frontend
-pnpm install
-pnpm dev
+npm install
+npm run dev
 ```
 
 打开 http://127.0.0.1:5173 ，用 `.env` 里的 `MASTER_PASSWORD` 登录。
