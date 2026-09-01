@@ -9,7 +9,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import require_auth
 from app.database import get_db
-from app.models import ApiKey, CallLog, KeyStatus, Provider
+from app.models import ApiKey, DailyUsage, KeyStatus, Provider
+from app.services.usage import rollup_date
 
 router = APIRouter(
     prefix="/stats",
@@ -39,23 +40,25 @@ async def usage(
     days: int = Query(14, ge=1, le=365),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    since = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=days)
+    # 先把今天（可能还在增长）重算进聚合表，保证当天数据新鲜
+    today = datetime.now(timezone.utc).replace(tzinfo=None).date()
+    await rollup_date(db, today)
 
-    base = select(CallLog).where(CallLog.created_at >= since)
+    start = today - timedelta(days=days - 1)
 
-    # 按日聚合
+    # 按日聚合（读预聚合小表，不再扫 call_logs 明细）
     daily_stmt = (
         select(
-            func.date(CallLog.created_at).label("d"),
-            func.count().label("calls"),
-            func.sum(CallLog.prompt_tokens).label("pt"),
-            func.sum(CallLog.completion_tokens).label("ct"),
-            func.sum(CallLog.total_tokens).label("tt"),
-            func.sum(CallLog.cost).label("cost"),
+            DailyUsage.day.label("d"),
+            func.sum(DailyUsage.calls).label("calls"),
+            func.sum(DailyUsage.prompt_tokens).label("pt"),
+            func.sum(DailyUsage.completion_tokens).label("ct"),
+            func.sum(DailyUsage.total_tokens).label("tt"),
+            func.sum(DailyUsage.cost).label("cost"),
         )
-        .where(CallLog.created_at >= since)
-        .group_by(func.date(CallLog.created_at))
-        .order_by(func.date(CallLog.created_at))
+        .where(DailyUsage.day >= start, DailyUsage.day <= today)
+        .group_by(DailyUsage.day)
+        .order_by(DailyUsage.day)
     )
     daily_rows = (await db.execute(daily_stmt)).all()
     daily = [
@@ -71,17 +74,16 @@ async def usage(
     ]
 
     # 按模型聚合
-    model_field = func.coalesce(func.nullif(CallLog.native_model, ""), CallLog.virtual_model)
     model_stmt = (
         select(
-            model_field.label("m"),
-            func.count().label("calls"),
-            func.sum(CallLog.total_tokens).label("tt"),
-            func.sum(CallLog.cost).label("cost"),
+            DailyUsage.model.label("m"),
+            func.sum(DailyUsage.calls).label("calls"),
+            func.sum(DailyUsage.total_tokens).label("tt"),
+            func.sum(DailyUsage.cost).label("cost"),
         )
-        .where(CallLog.created_at >= since)
-        .group_by(model_field)
-        .order_by(func.sum(CallLog.cost).desc())
+        .where(DailyUsage.day >= start, DailyUsage.day <= today)
+        .group_by(DailyUsage.model)
+        .order_by(func.sum(DailyUsage.cost).desc())
     )
     model_rows = (await db.execute(model_stmt)).all()
     by_model = [
@@ -91,10 +93,10 @@ async def usage(
 
     # 汇总
     totals_stmt = select(
-        func.count().label("calls"),
-        func.sum(CallLog.total_tokens).label("tt"),
-        func.sum(CallLog.cost).label("cost"),
-    ).where(CallLog.created_at >= since)
+        func.sum(DailyUsage.calls).label("calls"),
+        func.sum(DailyUsage.total_tokens).label("tt"),
+        func.sum(DailyUsage.cost).label("cost"),
+    ).where(DailyUsage.day >= start, DailyUsage.day <= today)
     t = (await db.execute(totals_stmt)).one()
     return {
         "days": days,

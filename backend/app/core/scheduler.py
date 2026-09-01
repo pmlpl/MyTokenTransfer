@@ -8,6 +8,7 @@ from sqlalchemy import select
 from app.database import AsyncSessionLocal
 from app.models import ApiKey, KeyStatus
 from app.services.health_check import test_key
+from app.services.usage import rollup_date, rollup_recent
 
 log = structlog.get_logger()
 scheduler = AsyncIOScheduler()
@@ -36,6 +37,22 @@ async def sweep_degraded_keys() -> None:
         log.info("sweep_done", total=len(keys), recovered=recovered)
 
 
+async def rollup_yesterday() -> None:
+    """每日固化前一天的用量聚合（凌晨跑，把昨天定为最终值）。"""
+    from datetime import datetime, timedelta, timezone
+
+    yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).date()
+    async with AsyncSessionLocal() as db:
+        await rollup_date(db, yesterday)
+    log.info("rollup_yesterday_done", day=str(yesterday))
+
+
+async def backfill_usage() -> None:
+    """启动回填：把最近 60 天的 CallLog 聚合进 DailyUsage。"""
+    async with AsyncSessionLocal() as db:
+        await rollup_recent(db, days=60)
+
+
 def start_scheduler() -> None:
     scheduler.add_job(
         sweep_degraded_keys,
@@ -49,6 +66,22 @@ def start_scheduler() -> None:
         sweep_degraded_keys,
         "date",
         id="sweep_first",
+        replace_existing=True,
+    )
+    # 每日凌晨 02:30 固化前一天的用量聚合
+    scheduler.add_job(
+        rollup_yesterday,
+        "cron",
+        hour=2,
+        minute=30,
+        id="rollup_yesterday",
+        replace_existing=True,
+    )
+    # 启动后 40 秒回填最近 60 天聚合
+    scheduler.add_job(
+        backfill_usage,
+        "date",
+        id="rollup_backfill",
         replace_existing=True,
     )
     scheduler.start()

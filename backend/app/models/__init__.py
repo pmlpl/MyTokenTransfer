@@ -3,6 +3,7 @@ from __future__ import annotations
 from app.models.alert import AlertEvent
 from app.models.api_key import ApiKey
 from app.models.base import TimestampMixin
+from app.models.daily_usage import DailyUsage
 from app.models.enums import KeyStatus, KeyStrategy, ProbeKind
 from app.models.key_group import KeyGroup
 from app.models.pricing import ModelPricing
@@ -24,4 +25,5 @@ __all__ = [
     "ModelMapping",
     "CallLog",
     "ModelPricing",
+    "DailyUsage",
 ]
