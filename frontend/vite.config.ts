@@ -11,7 +11,8 @@ export default defineConfig({
   },
   server: {
     host: '127.0.0.1',
-    port: 5173,
+    port: 5175,
+    strictPort: true,
     watch: {
       // E 盘为 exFAT，文件事件不可靠，改用轮询监听
       usePolling: true,

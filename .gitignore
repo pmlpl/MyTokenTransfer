@@ -20,6 +20,9 @@ dist-ssr/
 *.local
 .vite/
 .npm/
+# vite 配置编译产物（vue-tsc -b 生成，会盖住 vite.config.ts，勿提交）
+vite.config.js
+vite.config.d.ts
 
 # Env & secrets
 .env

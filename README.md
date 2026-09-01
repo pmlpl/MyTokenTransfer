@@ -10,12 +10,12 @@
 
 ## 统一网关接入（给任意 OpenAI 兼容客户端）
 ```
-Base URL: http://127.0.0.1:8000/v1
+Base URL: http://127.0.0.1:8082/v1
 API Key:  <GATEWAY_TOKEN>（backend/.env，或管理台 Playground 页查看）
 ```
 ```python
 from openai import OpenAI
-client = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="<GATEWAY_TOKEN>")
+client = OpenAI(base_url="http://127.0.0.1:8082/v1", api_key="<GATEWAY_TOKEN>")
 r = client.chat.completions.create(model="<通道虚拟模型名>", messages=[...])
 ```
 流程：密钥页录入多账号 key → 建供应商（含模型列表）→ 转发通道页把 key 组成池（T0 主池，可加 T1+ 跨供应商兜底层与模型映射）→ 客户端只需统一地址 + 统一密钥。
@@ -43,7 +43,7 @@ source .venv/Scripts/activate   # Git Bash on Windows
 pip install -e .
 cp .env.example .env            # 按需修改
 alembic upgrade head
-uvicorn app.main:app --reload --host 127.0.0.1 --port 8000
+uvicorn app.main:app --reload --host 127.0.0.1 --port 8082
 ```
 
 ### 3. 前端
@@ -53,7 +53,7 @@ npm install
 npm run dev
 ```
 
-打开 http://127.0.0.1:5173 ，用 `.env` 里的 `MASTER_PASSWORD` 登录。
+打开 http://127.0.0.1:5175 ，用 `.env` 里的 `MASTER_PASSWORD` 登录。
 
 ## 文档
 详见实施计划（项目根 `PLAN.md` 待补）。
