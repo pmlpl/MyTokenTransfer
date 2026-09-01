@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.deps import require_gateway
 from app.database import get_db
 from app.models import Channel
-from app.relay.gateway import route_chat_completions
+from app.relay.gateway import route_chat_completions, route_embeddings
 
 router = APIRouter(
     prefix="/v1",
@@ -35,6 +35,21 @@ async def chat_completions(request: Request, db: AsyncSession = Depends(get_db))
     if not channel:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"未找到 model '{model}' 对应的通道")
     return await route_chat_completions(channel, body, db)
+
+
+@router.post("/embeddings")
+async def embeddings(request: Request, db: AsyncSession = Depends(get_db)):
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "请求体不是合法 JSON")
+    model = body.get("model")
+    if not model:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "缺少 model 字段")
+    channel = await _load_channel(model, db)
+    if not channel:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"未找到 model '{model}' 对应的通道")
+    return await route_embeddings(channel, body, db)
 
 
 @router.get("/models")

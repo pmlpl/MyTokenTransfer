@@ -369,3 +369,94 @@ async def _stream_passthrough(client: httpx.AsyncClient, response: httpx.Respons
                 stream=True,
             )
         )
+
+
+async def route_embeddings(channel: Channel, body: dict, db: AsyncSession) -> JSONResponse:
+    """/v1/embeddings：复用同一套 Tier fallback + 池内负载均衡 + key 状态机。
+
+    与 chat 不同的是：embeddings 不支持流式，响应 usage 仅含 prompt/total tokens。
+    """
+    virtual = channel.virtual_model
+    max_retries = max(1, channel.max_retries)
+
+    tiers = sorted(channel.tiers, key=lambda t: t.order)
+    attempts: list[tuple[ChannelTier, ApiKey]] = []
+    for tier in tiers:
+        keys = await _ordered_keys(tier, channel.strategy, db)
+        for k in keys[:max_retries]:
+            attempts.append((tier, k))
+
+    if not attempts:
+        return JSONResponse(
+            status_code=503,
+            content={"error": {"message": "无可用密钥（全部失效/限流）", "type": "no_available_key"}},
+        )
+
+    last_error = "无可用上游"
+    for tier, key in attempts:
+        native = await _resolve_native(virtual, tier.provider_id, db)
+        base = _base_url(tier.provider)
+        if not base:
+            last_error = f"供应商 {tier.provider.slug} 缺少 base_url"
+            continue
+        url = _join(base, "embeddings")
+        try:
+            raw = decrypt_value(key.key_value)
+        except Exception:
+            await _mark_key(key, KeyStatus.invalid, db, message="密文解密失败")
+            continue
+
+        # embeddings 不支持 stream，仅透传 model 与 input 等参数
+        payload = dict(body)
+        payload["model"] = native
+        t0 = time.time()
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0)) as client:
+                resp = await client.post(url, headers=_headers(raw), json=payload)
+        except Exception as e:
+            last_error = f"{type(e).__name__}: {e}"
+            continue
+        latency_ms = int((time.time() - t0) * 1000)
+        if resp.status_code == 200:
+            data = resp.json()
+            await _write_log(
+                channel_id=channel.id,
+                tier_order=tier.order,
+                provider_id=tier.provider_id,
+                key_id=key.id,
+                virtual_model=virtual,
+                native_model=native,
+                usage=data.get("usage"),
+                latency_ms=latency_ms,
+                status="success",
+                error=None,
+                stream=False,
+            )
+            return JSONResponse(status_code=200, content=data)
+        retry, mark, msg = _classify_error(resp.status_code, resp.text)
+        await _mark_key(key, mark, db, message=msg)
+        await _write_log(
+            channel_id=channel.id,
+            tier_order=tier.order,
+            provider_id=tier.provider_id,
+            key_id=key.id,
+            virtual_model=virtual,
+            native_model=native,
+            usage=None,
+            latency_ms=latency_ms,
+            status="error",
+            error=msg,
+            stream=False,
+        )
+        last_error = msg
+        if retry:
+            continue
+        return JSONResponse(
+            status_code=resp.status_code,
+            content={"error": {"message": msg, "type": "upstream_error"}},
+        )
+
+    return JSONResponse(
+        status_code=502,
+        content={"error": {"message": f"所有上游均失败：{last_error}", "type": "all_upstreams_failed"}},
+    )
