@@ -11,6 +11,7 @@ import json
 import time
 
 import httpx
+import structlog
 from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -25,6 +26,8 @@ from app.relay.balancer import (
     resolve_native,
 )
 from app.services.health_check import _join
+
+log = structlog.get_logger("relay")
 
 
 def _build_payload(body: dict, native_model: str, stream: bool) -> dict:
@@ -69,6 +72,7 @@ async def route_chat_completions(
 
     attempts = await _build_attempts(channel, db)
     if not attempts:
+        log.warning("no_available_key", channel_id=channel.id, virtual_model=virtual)
         return _no_key_response()
 
     last_error = "无可用上游"
@@ -171,6 +175,12 @@ async def route_chat_completions(
                 content={"error": {"message": msg, "type": "upstream_error"}},
             )
 
+    log.warning(
+        "all_upstreams_failed",
+        channel_id=channel.id,
+        virtual_model=virtual,
+        error=last_error,
+    )
     return JSONResponse(
         status_code=502,
         content={"error": {"message": f"所有上游均失败：{last_error}", "type": "all_upstreams_failed"}},
@@ -233,6 +243,7 @@ async def route_embeddings(channel: Channel, body: dict, db: AsyncSession) -> JS
 
     attempts = await _build_attempts(channel, db)
     if not attempts:
+        log.warning("no_available_key", channel_id=channel.id, virtual_model=virtual)
         return _no_key_response()
 
     last_error = "无可用上游"
@@ -299,6 +310,12 @@ async def route_embeddings(channel: Channel, body: dict, db: AsyncSession) -> JS
             content={"error": {"message": msg, "type": "upstream_error"}},
         )
 
+    log.warning(
+        "all_upstreams_failed",
+        channel_id=channel.id,
+        virtual_model=virtual,
+        error=last_error,
+    )
     return JSONResponse(
         status_code=502,
         content={"error": {"message": f"所有上游均失败：{last_error}", "type": "all_upstreams_failed"}},

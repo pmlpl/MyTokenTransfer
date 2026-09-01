@@ -7,12 +7,15 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import ApiKey, ChannelKey, ChannelTier, KeyStatus, ModelMapping
 from app.models.enums import KeyStrategy
 from app.services.health_check import _DEFAULT_BASES, _join
+
+log = structlog.get_logger("relay")
 
 # 限流冷却时长（秒）：命中 429 时把 key 标 rate_limited 并冷却这段时间
 _RATE_LIMIT_COOLDOWN = 60
@@ -113,6 +116,14 @@ async def mark_key(
     key.status = status
     if status == KeyStatus.rate_limited:
         key.rate_limited_until = now_utc() + timedelta(seconds=_RATE_LIMIT_COOLDOWN)
+    log.warning(
+        "key_status_changed",
+        key_id=key.id,
+        provider_id=key.provider_id,
+        before=before.value if before else None,
+        after=status.value,
+        message=message,
+    )
     # 状态劣化到 exhausted/invalid 时写一条告警（由调用方随同 commit）
     from app.services.alerts import emit_key_alert
 
