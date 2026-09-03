@@ -1,6 +1,11 @@
 import axios from 'axios'
-import { ElMessage } from 'element-plus'
+import { createDiscreteApi } from 'naive-ui'
 import { useAuthStore } from '@/stores/auth'
+
+// axios 拦截器在组件 setup 之外，用 Naive UI 的 discrete API 创建全局 message 实例
+// 主题不跟随 NConfigProvider（discrete 是独立容器），但错误提示主题差异可接受
+// 传入 ['message'] 仅创建 message API，避免无谓初始化 dialog/notification/loadingBar
+const { message: discreteMessage } = createDiscreteApi(['message'])
 
 const client = axios.create({
   baseURL: import.meta.env.VITE_API_BASE || 'http://127.0.0.1:8000',
@@ -30,11 +35,11 @@ client.interceptors.response.use(
       if (router.currentRoute.value.name !== 'login') {
         router.push({ name: 'login' })
       }
-      ElMessage.error('会话已失效，请重新登录')
+      discreteMessage.error('会话已失效，请重新登录')
     } else if (err.response?.data?.detail) {
-      ElMessage.error(err.response.data.detail)
+      discreteMessage.error(err.response.data.detail)
     } else {
-      ElMessage.error(err.message || '请求失败')
+      discreteMessage.error(err.message || '请求失败')
     }
     return Promise.reject(err)
   },

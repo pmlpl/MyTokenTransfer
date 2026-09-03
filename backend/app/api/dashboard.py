@@ -54,6 +54,7 @@ async def usage(
             func.sum(DailyUsage.prompt_tokens).label("pt"),
             func.sum(DailyUsage.completion_tokens).label("ct"),
             func.sum(DailyUsage.total_tokens).label("tt"),
+            func.sum(DailyUsage.cached_tokens).label("cached"),
             func.sum(DailyUsage.cost).label("cost"),
         )
         .where(DailyUsage.day >= start, DailyUsage.day <= today)
@@ -68,9 +69,33 @@ async def usage(
             "prompt_tokens": int(r.pt or 0),
             "completion_tokens": int(r.ct or 0),
             "total_tokens": int(r.tt or 0),
+            "cached_tokens": int(r.cached or 0),
             "cost": float(r.cost or 0),
         }
         for r in daily_rows
+    ]
+
+    # 按日×按模型聚合：v2 真按模型堆叠面积图需要的维度
+    daily_bm_stmt = (
+        select(
+            DailyUsage.day.label("d"),
+            DailyUsage.model.label("m"),
+            func.sum(DailyUsage.total_tokens).label("tt"),
+            func.sum(DailyUsage.cost).label("cost"),
+        )
+        .where(DailyUsage.day >= start, DailyUsage.day <= today)
+        .group_by(DailyUsage.day, DailyUsage.model)
+        .order_by(DailyUsage.day, func.sum(DailyUsage.total_tokens).desc())
+    )
+    daily_bm_rows = (await db.execute(daily_bm_stmt)).all()
+    daily_by_model = [
+        {
+            "date": str(r.d),
+            "model": str(r.m or "未知"),
+            "total_tokens": int(r.tt or 0),
+            "cost": float(r.cost or 0),
+        }
+        for r in daily_bm_rows
     ]
 
     # 按模型聚合
@@ -95,16 +120,25 @@ async def usage(
     totals_stmt = select(
         func.sum(DailyUsage.calls).label("calls"),
         func.sum(DailyUsage.total_tokens).label("tt"),
+        func.sum(DailyUsage.cached_tokens).label("cached"),
         func.sum(DailyUsage.cost).label("cost"),
     ).where(DailyUsage.day >= start, DailyUsage.day <= today)
     t = (await db.execute(totals_stmt)).one()
+    total_tokens = int(t.tt or 0)
+    cached_tokens = int(t.cached or 0)
+    # 缓存命中率 = cached_tokens / prompt_tokens（缓存命中发生在输入侧）
+    prompt_sum = sum(d["prompt_tokens"] for d in daily)
+    cache_hit_rate = round(cached_tokens / prompt_sum * 100, 2) if prompt_sum > 0 else 0.0
     return {
         "days": days,
         "daily": daily,
+        "daily_by_model": daily_by_model,
         "by_model": by_model,
         "totals": {
             "calls": int(t.calls or 0),
-            "total_tokens": int(t.tt or 0),
+            "total_tokens": total_tokens,
+            "cached_tokens": cached_tokens,
+            "cache_hit_rate": cache_hit_rate,
             "cost": float(t.cost or 0),
         },
     }

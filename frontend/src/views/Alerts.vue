@@ -1,66 +1,107 @@
 <template>
-  <div>
-    <div class="toolbar">
-      <span class="hint">密钥状态劣化（额度耗尽 / 认证失效）时自动记录告警事件。</span>
-      <div style="flex: 1" />
-      <el-radio-group v-model="filter" @change="load">
-        <el-radio-button :value="false">全部</el-radio-button>
-        <el-radio-button :value="true">未解决</el-radio-button>
-      </el-radio-group>
-      <el-button :icon="Refresh" @click="load" style="margin-left: 12px" />
-    </div>
+  <div class="alerts-page">
+    <PageHeader title="告警事件" subtitle="密钥状态劣化（额度耗尽 / 认证失效）自动记录">
+      <template #actions>
+        <n-radio-group v-model:value="filter" @update:value="load">
+          <n-radio-button :value="false">全部</n-radio-button>
+          <n-radio-button :value="true">未解决</n-radio-button>
+        </n-radio-group>
+        <n-button quaternary circle @click="load">
+          <template #icon>
+            <n-icon :component="RefreshIcon" />
+          </template>
+        </n-button>
+      </template>
+    </PageHeader>
 
-    <el-table v-loading="loading" :data="list" stripe>
-      <el-table-column label="级别" width="100">
-        <template #default="{ row }">
-          <el-tag :type="row.severity === 'critical' ? 'danger' : 'warning'" size="small">
-            {{ row.severity }}
-          </el-tag>
-        </template>
-      </el-table-column>
-      <el-table-column label="类型" width="150">
-        <template #default="{ row }">{{ typeLabel(row.type) }}</template>
-      </el-table-column>
-      <el-table-column prop="message" label="事件" min-width="320" show-overflow-tooltip />
-      <el-table-column label="密钥" width="90">
-        <template #default="{ row }">{{ row.key_id ?? '-' }}</template>
-      </el-table-column>
-      <el-table-column label="状态" width="90">
-        <template #default="{ row }">
-          <el-tag :type="row.resolved ? 'info' : 'danger'" size="small" effect="plain">
-            {{ row.resolved ? '已解决' : '未解决' }}
-          </el-tag>
-        </template>
-      </el-table-column>
-      <el-table-column label="时间" width="170">
-        <template #default="{ row }">{{ fmt(row.created_at) }}</template>
-      </el-table-column>
-      <el-table-column label="操作" width="110" fixed="right">
-        <template #default="{ row }">
-          <el-button
-            v-if="!row.resolved"
-            link
-            size="small"
-            type="success"
-            :loading="row._resolving"
-            @click="onResolve(row)"
-          >标记解决</el-button>
-          <span v-else style="color: #909399; font-size: 12px">{{ fmt(row.resolved_at) }}</span>
-        </template>
-      </el-table-column>
-    </el-table>
+    <DataCard title="告警列表">
+      <n-data-table
+        :columns="columns"
+        :data="list"
+        :loading="loading"
+        :bordered="false"
+        :single-line="false"
+        size="small"
+      />
+    </DataCard>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
-import { Refresh } from '@element-plus/icons-vue'
-import { ElMessage } from 'element-plus'
+import { h, ref, onMounted } from 'vue'
+import {
+  NButton, NDataTable, NRadioGroup, NRadioButton, NTag, NIcon,
+  useMessage, type DataTableColumns,
+} from 'naive-ui'
+import { Refresh as RefreshIcon } from '@vicons/ionicons5'
 import { api, type AlertItem } from '@/api'
+import PageHeader from '@/design/components/PageHeader.vue'
+import DataCard from '@/design/components/DataCard.vue'
 
-const list = ref<(AlertItem & { _resolving?: boolean })[]>([])
+type AlertRow = AlertItem & { _resolving?: boolean }
+
+const list = ref<AlertRow[]>([])
 const loading = ref(false)
 const filter = ref(true)
+const message = useMessage()
+
+const columns: DataTableColumns<AlertRow> = [
+  {
+    title: '级别',
+    key: 'severity',
+    width: 100,
+    render: (row) =>
+      h(
+        NTag,
+        { type: row.severity === 'critical' ? 'error' : 'warning', size: 'small' },
+        { default: () => row.severity },
+      ),
+  },
+  {
+    title: '类型',
+    key: 'type',
+    width: 150,
+    render: (row) => typeLabel(row.type),
+  },
+  { title: '事件', key: 'message', minWidth: 320, ellipsis: { tooltip: true } },
+  {
+    title: '密钥',
+    key: 'key_id',
+    width: 90,
+    render: (row) => (row.key_id ?? '-'),
+  },
+  {
+    title: '状态',
+    key: 'resolved',
+    width: 90,
+    render: (row) =>
+      h(
+        NTag,
+        { type: row.resolved ? 'default' : 'error', size: 'small', bordered: false },
+        { default: () => (row.resolved ? '已解决' : '未解决') },
+      ),
+  },
+  {
+    title: '时间',
+    key: 'created_at',
+    width: 170,
+    render: (row) => fmt(row.created_at),
+  },
+  {
+    title: '操作',
+    key: 'actions',
+    width: 110,
+    fixed: 'right',
+    render: (row) =>
+      row.resolved
+        ? h('span', { style: 'color: var(--app-text-secondary); font-size: 12px' }, fmt(row.resolved_at))
+        : h(
+            NButton,
+            { size: 'tiny', quaternary: true, type: 'success', loading: row._resolving, onClick: () => onResolve(row) },
+            { default: () => '标记解决' },
+          ),
+  },
+]
 
 async function load() {
   loading.value = true
@@ -74,11 +115,11 @@ async function load() {
   }
 }
 
-async function onResolve(row: AlertItem & { _resolving?: boolean }) {
+async function onResolve(row: AlertRow) {
   row._resolving = true
   try {
     await api.alerts.resolve(row.id)
-    ElMessage.success('已标记解决')
+    message.success('已标记解决')
     await load()
   } catch {
     // 拦截器已提示
@@ -88,7 +129,7 @@ async function onResolve(row: AlertItem & { _resolving?: boolean }) {
 }
 
 function typeLabel(t: string) {
-  return { key_exhausted: '密钥额度耗尽', key_invalid: '密钥认证失效' }[t] || t
+  return ({ key_exhausted: '密钥额度耗尽', key_invalid: '密钥认证失效' } as const)[t as 'key_exhausted'] || t
 }
 function fmt(s: string | null) {
   if (!s) return '-'
@@ -99,6 +140,9 @@ onMounted(load)
 </script>
 
 <style scoped>
-.toolbar { display: flex; align-items: center; margin-bottom: 16px; gap: 8px; }
-.hint { color: #909399; font-size: 12px; }
+.alerts-page {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
 </style>

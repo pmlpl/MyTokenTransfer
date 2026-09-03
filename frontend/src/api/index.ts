@@ -101,6 +101,7 @@ export interface Pricing {
   id: number
   model_name: string
   input_price: number
+  cached_input_price: number
   output_price: number
   currency: string
   note: string | null
@@ -110,9 +111,10 @@ export interface Pricing {
 
 export interface UsageResp {
   days: number
-  daily: { date: string; calls: number; prompt_tokens: number; completion_tokens: number; total_tokens: number; cost: number }[]
+  daily: { date: string; calls: number; prompt_tokens: number; completion_tokens: number; total_tokens: number; cached_tokens: number; cost: number }[]
+  daily_by_model: { date: string; model: string; total_tokens: number; cost: number }[]
   by_model: { model: string; calls: number; total_tokens: number; cost: number }[]
-  totals: { calls: number; total_tokens: number; cost: number }
+  totals: { calls: number; total_tokens: number; cached_tokens: number; cache_hit_rate: number; cost: number }
 }
 
 export interface AlertItem {
@@ -138,6 +140,8 @@ export const api = {
     login: (password: string) =>
       client.post<{ token: string; token_type: string }>('/auth/login', { password }).then((r) => r.data),
     me: () => client.get('/auth/me').then((r) => r.data),
+    changePassword: (old_password: string, new_password: string) =>
+      client.post<{ ok: boolean; message: string }>('/auth/change-password', { old_password, new_password }).then((r) => r.data),
   },
   providers: {
     list: () => client.get<Provider[]>('/providers').then((r) => r.data),

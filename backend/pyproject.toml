@@ -16,6 +16,8 @@ dependencies = [
     "httpx>=0.27",
     "structlog>=24.1",
     "apscheduler>=3.10",
+    # Redis：session pin / 限流 / 热点缓存（async 支持，5.x 自带 asyncio API）
+    "redis>=5.0",
 ]
 
 [project.optional-dependencies]

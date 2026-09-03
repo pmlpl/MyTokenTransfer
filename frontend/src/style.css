@@ -1,0 +1,14 @@
+/* Phase 0：tailwind 全局入口。只引 utilities（base/components 已关 preflight，避免与 Naive UI 冲突） */
+@tailwind utilities;
+
+/* —— 全局基础：页面背景与字体 —— */
+html,
+body,
+#app {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  font-family: 'vfonts Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}

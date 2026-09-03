@@ -44,6 +44,7 @@ async def rollup_date(db: AsyncSession, d: date) -> int:
             func.sum(CallLog.prompt_tokens).label("pt"),
             func.sum(CallLog.completion_tokens).label("ct"),
             func.sum(CallLog.total_tokens).label("tt"),
+            func.sum(CallLog.cached_tokens).label("cached"),
             func.sum(CallLog.cost).label("cost"),
         )
         .where(CallLog.created_at >= start, CallLog.created_at < end)
@@ -60,6 +61,7 @@ async def rollup_date(db: AsyncSession, d: date) -> int:
                 prompt_tokens=int(r.pt or 0),
                 completion_tokens=int(r.ct or 0),
                 total_tokens=int(r.tt or 0),
+                cached_tokens=int(r.cached or 0),
                 cost=float(r.cost or 0),
             )
         )

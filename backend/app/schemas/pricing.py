@@ -8,6 +8,7 @@ from pydantic import BaseModel, ConfigDict
 class PricingBase(BaseModel):
     model_name: str
     input_price: float = 0.0
+    cached_input_price: float = 0.0
     output_price: float = 0.0
     currency: str = "CNY"
     note: str | None = None
@@ -19,6 +20,7 @@ class PricingCreate(PricingBase):
 
 class PricingUpdate(BaseModel):
     input_price: float | None = None
+    cached_input_price: float | None = None
     output_price: float | None = None
     currency: str | None = None
     note: str | None = None

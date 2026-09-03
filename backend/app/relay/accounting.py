@@ -34,6 +34,13 @@ async def write_call_log(
     u = usage or {}
     pt = int(u.get("prompt_tokens", 0) or 0)
     ct = int(u.get("completion_tokens", 0) or 0)
+    # 缓存命中 tokens：兼容 OpenAI (prompt_tokens_details.cached_tokens) 和 DeepSeek (prompt_cache_hit_tokens)
+    cached = 0
+    ptd = u.get("prompt_tokens_details")
+    if isinstance(ptd, dict):
+        cached = int(ptd.get("cached_tokens", 0) or 0)
+    if not cached:
+        cached = int(u.get("prompt_cache_hit_tokens", 0) or 0)
     async with AsyncSessionLocal() as s:
         cost = 0.0
         model_for_price = native_model or virtual_model
@@ -42,8 +49,11 @@ async def write_call_log(
                 select(ModelPricing).where(ModelPricing.model_name == model_for_price)
             )
             if p is not None:
+                uncached = max(0, pt - cached)
                 cost = round(
-                    pt * float(p.input_price) / 1_000_000 + ct * float(p.output_price) / 1_000_000,
+                    cached * float(p.cached_input_price) / 1_000_000
+                    + uncached * float(p.input_price) / 1_000_000
+                    + ct * float(p.output_price) / 1_000_000,
                     6,
                 )
         s.add(
@@ -58,6 +68,7 @@ async def write_call_log(
                 prompt_tokens=pt,
                 completion_tokens=ct,
                 total_tokens=int(u.get("total_tokens", 0) or 0),
+                cached_tokens=cached,
                 cost=cost,
                 latency_ms=latency_ms,
                 status=status,

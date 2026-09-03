@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import timedelta
+
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -7,6 +9,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.deps import require_auth
 from app.database import get_db
 from app.models import CallLog
+
+# CallLog.created_at 以 UTC 存储（见 relay/accounting.py _now()），API 返回时转东八区
+_UTC_OFFSET = timedelta(hours=8)
 
 router = APIRouter(
     prefix="/logs",
@@ -35,7 +40,7 @@ async def list_logs(
         items.append(
             {
                 "id": r.id,
-                "created_at": r.created_at.isoformat() if r.created_at else None,
+                "created_at": (r.created_at + _UTC_OFFSET).isoformat() if r.created_at else None,
                 "channel_id": r.channel_id,
                 "tier_order": r.tier_order,
                 "provider_id": r.provider_id,
@@ -45,6 +50,7 @@ async def list_logs(
                 "prompt_tokens": r.prompt_tokens,
                 "completion_tokens": r.completion_tokens,
                 "total_tokens": r.total_tokens,
+                "cached_tokens": r.cached_tokens,
                 "cost": float(r.cost),
                 "latency_ms": r.latency_ms,
                 "status": r.status,

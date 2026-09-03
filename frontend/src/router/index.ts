@@ -19,6 +19,7 @@ const router = createRouter({
         { path: 'usage', name: 'usage', component: () => import('@/views/Usage.vue') },
         { path: 'pricing', name: 'pricing', component: () => import('@/views/Pricing.vue') },
         { path: 'alerts', name: 'alerts', component: () => import('@/views/Alerts.vue') },
+        { path: 'settings', name: 'settings', component: () => import('@/views/Settings.vue') },
       ],
     },
   ],

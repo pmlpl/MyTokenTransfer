@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -22,6 +23,10 @@ _DEFAULT_BASES = {
 
 # 限流冷却时长（秒）
 _RATE_LIMIT_COOLDOWN = 60
+
+# 网络层瞬时故障重试（容器 NAT 到部分上游端点偶发 TLS 握手超时/连接重置）
+_PROBE_ATTEMPTS = 3
+_RETRY_BACKOFF = 1.0  # 秒
 
 _VERSION_TAIL = re.compile(r"/v\d+$")
 
@@ -51,13 +56,34 @@ def _first_model(provider: Provider) -> str | None:
     return None
 
 
+async def _request_with_retry(
+    method: str,
+    url: str,
+    *,
+    headers: dict[str, str] | None = None,
+    json_body: dict | None = None,
+    timeout: float = 15.0,
+) -> httpx.Response:
+    """带重试的 HTTP 请求。仅网络层故障（连接超时/握手失败/连接重置）重试；
+    HTTP 状态码一律不重试，由调用方分类。"""
+    last_exc: Exception | None = None
+    for attempt in range(_PROBE_ATTEMPTS):
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                return await client.request(method, url, headers=headers, json=json_body)
+        except Exception as e:
+            last_exc = e
+            if attempt < _PROBE_ATTEMPTS - 1:
+                await asyncio.sleep(_RETRY_BACKOFF)
+    raise last_exc  # type: ignore[misc]
+
+
 async def _probe_models(base: str, headers: dict[str, str]) -> ProbeResult | None:
     """探测列模型接口。返回 None 表示端点不可用，应交给对话兜底。"""
     url = _join(base, "models")
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.get(url, headers=headers)
-    except Exception as e:  # 网络层故障：瞬时，不改变 key 状态
+        resp = await _request_with_retry("GET", url, headers=headers)
+    except Exception as e:  # 重试后仍失败：网络层故障，不改变 key 状态
         return ProbeResult(False, None, None, f"{type(e).__name__}: {e}")
 
     if resp.status_code == 200:
@@ -80,10 +106,13 @@ async def _probe_chat(base: str, headers: dict[str, str], model: str) -> ProbeRe
         "stream": False,
     }
     try:
-        async with httpx.AsyncClient(timeout=20.0) as client:
-            resp = await client.post(
-                url, headers={**headers, "Content-Type": "application/json"}, json=payload
-            )
+        resp = await _request_with_retry(
+            "POST",
+            url,
+            headers={**headers, "Content-Type": "application/json"},
+            json_body=payload,
+            timeout=20.0,
+        )
     except Exception as e:
         return ProbeResult(False, None, None, f"{type(e).__name__}: {e}", via="chat")
 
@@ -125,16 +154,15 @@ async def _probe(provider: Provider, raw_key: str) -> ProbeResult:
     if provider.probe_kind == ProbeKind.gemini_models:
         url = f"{base.rstrip('/')}/v1beta/models?key={raw_key}"
         try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                resp = await client.get(url)
+            resp = await _request_with_retry("GET", url)
         except Exception as e:
             return ProbeResult(False, None, None, f"{type(e).__name__}: {e}")
-    if resp.status_code == 200:
-        return ProbeResult(True, 200, None, None)
-    snippet = resp.text[:200] if resp.text else ""
-    return ProbeResult(
-        False, resp.status_code, None, f"HTTP {resp.status_code}: {snippet}", body=snippet
-    )
+        if resp.status_code == 200:
+            return ProbeResult(True, 200, None, None)
+        snippet = resp.text[:200] if resp.text else ""
+        return ProbeResult(
+            False, resp.status_code, None, f"HTTP {resp.status_code}: {snippet}"
+        )
 
     return ProbeResult(False, None, None, "不支持的探测方式")
 

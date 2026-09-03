@@ -1,0 +1,64 @@
+# ============================================================
+#  MyTokenTransfer —— dev overlay
+#  用法（在项目根目录）：
+#    powershell -File dev.ps1           # build deps + up
+#    powershell -File dev.ps1 stop
+#    powershell -File dev.ps1 logs
+#
+#  等价于：
+#    docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
+#
+#  效果：
+#    - backend  源码 bind-mount 进去 → uvicorn --reload
+#    - frontend 改用 node:20-alpine 跑 vite dev server (HMR)
+#    - 不再构建/启动 nginx 那个生产镜像
+#    - backend 额外暴露 127.0.0.1:8082 给前端 dev server 直连（CORS 已允许 5173）
+# ============================================================
+
+services:
+  backend:
+    # 覆盖 Dockerfile 的 ENTRYPOINT，避免被原 entrypoint.sh 拦截
+    entrypoint: ["sh", "-c"]
+    command: >-
+      "alembic upgrade head &&
+       exec uvicorn app.main:app --host 0.0.0.0 --port 8082 --reload --reload-dir /app/app"
+    volumes:
+      # 源码（宿主机）覆盖容器里的 /app；node_modules / __pycache__ 仍由容器自带
+      - ./backend:/app
+    # 暴露 8082 到宿主机，让 vite dev server 通过 VITE_API_BASE=http://127.0.0.1:8082 直连
+    ports:
+      - "127.0.0.1:8082:8082"
+    # uvicorn --reload 首次扫描慢，放宽健康探针的 start_period
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8082/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 60s
+
+  frontend:
+    # dev 模式不走 nginx 生产构建，直接用 node 跑 vite dev server
+    image: node:20-alpine
+    working_dir: /app
+    # 让 vite 在容器里能装包、能监听；watch 已开 usePolling 适配 Windows 挂载
+    command: >-
+      "npm install --no-audit --no-fund --prefer-offline &&
+       npm run dev -- --host 0.0.0.0 --port 5173 --strictPort"
+    volumes:
+      - ./frontend:/app
+      # 匿名卷：保护容器内 node_modules，不被宿主机空目录覆盖
+      - /app/node_modules
+    environment:
+      NODE_ENV: development
+      # .env.development 里的 VITE_API_BASE=http://127.0.0.1:8082 自动生效
+    ports:
+      - "127.0.0.1:5173:5173"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:5173/"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+    depends_on:
+      backend:
+        condition: service_healthy
