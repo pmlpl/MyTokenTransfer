@@ -6,7 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import require_gateway
 from app.database import get_db
-from app.models import Channel
+from app.models import Channel, ModelPricing
 from app.relay.gateway import route_chat_completions, route_embeddings
 
 router = APIRouter(
@@ -54,10 +54,18 @@ async def embeddings(request: Request, db: AsyncSession = Depends(get_db)):
 
 @router.get("/models")
 async def list_models(db: AsyncSession = Depends(get_db)):
-    """OpenAI 兼容的模型列表（来源：所有启用的通道）。"""
+    """OpenAI 兼容的模型列表（来源：所有启用的通道），并附上价格表里的上下文长度。"""
     rows = await db.execute(select(Channel).where(Channel.is_active.is_(True)).order_by(Channel.id))
+    channels = rows.scalars().all()
+    prices = await db.execute(select(ModelPricing))
+    ctx = {p.model_name: p.context_length for p in prices.scalars()}
     data = [
-        {"id": c.virtual_model, "object": "model", "owned_by": "mytokentransfer"}
-        for c in rows.scalars()
+        {
+            "id": c.virtual_model,
+            "object": "model",
+            "owned_by": "mytokentransfer",
+            "context_length": ctx.get(c.virtual_model, 0),
+        }
+        for c in channels
     ]
     return {"object": "list", "data": data}

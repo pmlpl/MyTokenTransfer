@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from sqlalchemy import Numeric, String
+from sqlalchemy import Integer, Numeric, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
@@ -17,5 +17,6 @@ class ModelPricing(Base, TimestampMixin):
     input_price: Mapped[float] = mapped_column(Numeric(12, 6), default=0, nullable=False)   # 每 1M 输入 tokens
     cached_input_price: Mapped[float] = mapped_column(Numeric(12, 6), default=0, nullable=False)  # 每 1M 缓存命中输入 tokens
     output_price: Mapped[float] = mapped_column(Numeric(12, 6), default=0, nullable=False)  # 每 1M 输出 tokens
+    context_length: Mapped[int] = mapped_column(Integer, default=0, nullable=False)  # 上下文长度（tokens），0=未设置
     currency: Mapped[str] = mapped_column(String(8), default="CNY", nullable=False)
     note: Mapped[str | None] = mapped_column(String(255), nullable=True)

@@ -61,6 +61,9 @@
         <n-form-item label="币种">
           <n-select v-model:value="form.currency" :options="currencyOptions" />
         </n-form-item>
+        <n-form-item label="上下文长度">
+          <n-input-number v-model:value="form.context_length" :min="0" :step="1024" style="width: 100%" placeholder="0=未设置，如 1048576" />
+        </n-form-item>
         <n-form-item label="备注">
           <n-input v-model:value="form.note" />
         </n-form-item>
@@ -113,7 +116,15 @@ const dialog = reactive<{ visible: boolean; id: number | null; saving: boolean }
   id: null,
   saving: false,
 })
-const form = reactive({ model_name: '', input_price: 0, cached_input_price: 0, output_price: 0, currency: 'CNY', note: '' })
+const form = reactive({ model_name: '', input_price: 0, cached_input_price: 0, output_price: 0, context_length: 0, currency: 'CNY', note: '' })
+
+// 上下文长度人读格式：0=未设置，>=1M 显示 "1M"，>=1K 显示 "128K"，否则原样
+function fmtContext(n: number): string {
+  if (!n) return '未设置'
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(n % 1_000_000 ? 1 : 0)}M`
+  if (n >= 1_000) return `${(n / 1_000).toFixed(n % 1_000 ? 1 : 0)}K`
+  return String(n)
+}
 
 const columns: DataTableColumns<Pricing> = [
   { title: '模型', key: 'model_name', minWidth: 200 },
@@ -134,6 +145,12 @@ const columns: DataTableColumns<Pricing> = [
     key: 'output_price',
     width: 150,
     render: (row) => `${row.output_price} ${row.currency}`,
+  },
+  {
+    title: '上下文',
+    key: 'context_length',
+    width: 120,
+    render: (row) => fmtContext(row.context_length),
   },
   { title: '备注', key: 'note', minWidth: 220 },
   {
@@ -236,7 +253,7 @@ const costOpt = computed(() => {
 
 function openAdd() {
   dialog.id = null
-  Object.assign(form, { model_name: '', input_price: 0, cached_input_price: 0, output_price: 0, currency: 'CNY', note: '' })
+  Object.assign(form, { model_name: '', input_price: 0, cached_input_price: 0, output_price: 0, context_length: 0, currency: 'CNY', note: '' })
   dialog.visible = true
 }
 
@@ -247,6 +264,7 @@ function openEdit(row: Pricing) {
     input_price: row.input_price,
     cached_input_price: row.cached_input_price,
     output_price: row.output_price,
+    context_length: row.context_length,
     currency: row.currency,
     note: row.note || '',
   })
@@ -265,6 +283,7 @@ async function onSave() {
         input_price: form.input_price,
         cached_input_price: form.cached_input_price,
         output_price: form.output_price,
+        context_length: form.context_length,
         currency: form.currency,
         note: form.note,
       })

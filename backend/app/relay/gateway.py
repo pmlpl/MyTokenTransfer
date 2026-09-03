@@ -93,7 +93,7 @@ async def route_chat_completions(
         t0 = time.time()
 
         if stream:
-            client = httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0))
+            client = httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=10.0))
             try:
                 req = client.build_request("POST", url, headers=_headers(raw), json=payload)
                 response = await client.send(req, stream=True)
@@ -130,7 +130,7 @@ async def route_chat_completions(
             )
         else:
             try:
-                async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0)) as client:
+                async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=10.0)) as client:
                     resp = await client.post(url, headers=_headers(raw), json=payload)
             except Exception as e:
                 last_error = f"{type(e).__name__}: {e}"
@@ -265,7 +265,7 @@ async def route_embeddings(channel: Channel, body: dict, db: AsyncSession) -> JS
         payload["model"] = native
         t0 = time.time()
         try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=10.0)) as client:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=10.0)) as client:
                 resp = await client.post(url, headers=_headers(raw), json=payload)
         except Exception as e:
             last_error = f"{type(e).__name__}: {e}"
