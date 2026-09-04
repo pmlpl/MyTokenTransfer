@@ -184,7 +184,7 @@ async def mark_key(
         message=message,
     )
     # 状态劣化到 exhausted/invalid 时写一条告警（由调用方随同 commit）
-    from app.services.alerts import emit_key_alert
+    from app.services.alerts import emit_key_alert, resolve_key_alerts
 
     await emit_key_alert(
         db,
@@ -195,4 +195,7 @@ async def mark_key(
         after=status,
         message=message or "上游请求失败",
     )
+    # key 从非 active 恢复为 active → 自动 resolve 其历史未解决告警
+    if status == KeyStatus.active and before != KeyStatus.active:
+        await resolve_key_alerts(db, key.id)
     await db.commit()
