@@ -98,7 +98,7 @@ import EmptyState from '@/design/components/EmptyState.vue'
 use([CanvasRenderer, BarChart, LineChart, GridComponent, TooltipComponent, LegendComponent])
 
 const data = ref<UsageResp | null>(null)
-const days = ref(14)
+const days = ref(1)
 const currency = ref('CNY')
 const metric = ref<'tokens' | 'calls' | 'cost' | 'cache'>('tokens')
 
@@ -255,7 +255,7 @@ const dailyOpt = computed(() => {
 function fmtCost(v: number) {
   const n = Number(v ?? 0)
   if (n === 0) return '0'
-  if (n < 0.01) return n.toExponential(2)
+  if (n < 0.01) return n.toFixed(6).replace(/\.?0+$/, '')
   return n.toFixed(4)
 }
 

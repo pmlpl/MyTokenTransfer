@@ -130,15 +130,25 @@ async def usage(
         .order_by(func.sum(DailyUsage.cost).desc())
     )
     key_rows = (await db.execute(key_stmt)).all()
-    key_names = {kid: name for kid, name in (await db.execute(select(ApiKey.id, ApiKey.name))).all()}
+    # 同时取 name 和 key_mask，name 为空时用掩码兜底，key 已删除时标注
+    key_info = {
+        kid: (name, mask)
+        for kid, name, mask in (await db.execute(select(ApiKey.id, ApiKey.name, ApiKey.key_mask))).all()
+    }
     by_key = []
     for r in key_rows:
         pt = int(r.pt or 0)
         cached = int(r.cached or 0)
+        info = key_info.get(r.kid)
+        display_name = (
+            (info[0] if info else None)
+            or (info[1] if info else None)
+            or (f"key#{r.kid}（已删除）" if r.kid is not None else "未知")
+        )
         by_key.append(
             {
                 "key_id": r.kid,
-                "key_name": key_names.get(r.kid) or (f"key#{r.kid}" if r.kid is not None else "未知"),
+                "key_name": display_name,
                 "calls": int(r.calls or 0),
                 "prompt_tokens": pt,
                 "cached_tokens": cached,
