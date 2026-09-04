@@ -9,7 +9,7 @@
       class="sider"
     >
       <div class="logo">
-        <span class="logo-mark">MT</span>
+        <img class="logo-mark" src="/logo.png" alt="MTT" />
         <span class="logo-text">MyTokenTransfer</span>
       </div>
       <n-menu
@@ -156,16 +156,15 @@ onUnmounted(() => {
   color: #fff;
 }
 .logo-mark {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 28px;
-  height: 28px;
-  background: v-bind('tokens.color.brand');
+  display: block;
+  width: 30px;
+  height: 30px;
+  padding: 3px;
+  background: #ffffff;
   border-radius: 8px;
-  font-size: 13px;
-  font-weight: 700;
-  letter-spacing: 0.5px;
+  object-fit: contain;
+  box-sizing: border-box;
+  flex-shrink: 0;
 }
 .logo-text {
   font-size: 15px;

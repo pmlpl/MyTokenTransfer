@@ -2,7 +2,7 @@
   <div class="login-wrap">
     <div class="login-card">
       <div class="brand">
-        <div class="brand-mark">MT</div>
+        <img class="brand-mark" src="/logo.png" alt="MTT" />
         <h2 class="brand-title">MyTokenTransfer</h2>
         <p class="brand-sub">API 密钥管理台 · 本地登录</p>
       </div>
@@ -86,18 +86,16 @@ async function onLogin() {
   margin-bottom: 28px;
 }
 .brand-mark {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
+  display: block;
   width: 48px;
   height: 48px;
-  background: #4f7cff;
+  padding: 4px;
+  background: #eef3ff;
+  border: 1px solid #e5e7eb;
   border-radius: 12px;
-  color: #fff;
-  font-size: 20px;
-  font-weight: 700;
-  letter-spacing: 0.5px;
-  margin-bottom: 12px;
+  object-fit: contain;
+  box-sizing: border-box;
+  margin: 0 auto 12px;
 }
 .brand-title {
   margin: 0 0 4px;
