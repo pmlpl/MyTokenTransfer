@@ -42,6 +42,42 @@
       <v-chart v-if="dailyOpt" :option="dailyOpt" autoresize style="height: 320px" />
       <EmptyState v-else title="无数据" description="近段时间无调用记录" />
     </DataCard>
+
+    <!-- 各密钥缓存命中率 -->
+    <DataCard title="各密钥缓存命中率" description="缓存按上游 key 隔离；命中率偏低说明该 key 存在冷启动或 key 抖动">
+      <div v-if="byKey.length" class="key-table-wrap">
+        <table class="key-table">
+          <thead>
+            <tr>
+              <th>密钥</th>
+              <th>调用次数</th>
+              <th>输入 Tokens</th>
+              <th>命中 Tokens</th>
+              <th>命中率</th>
+              <th>成本</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="k in byKey" :key="k.key_id ?? k.key_name">
+              <td class="key-name">{{ k.key_name }}</td>
+              <td>{{ Number(k.calls).toLocaleString() }}</td>
+              <td>{{ fmtAxis(k.prompt_tokens) }}</td>
+              <td>{{ fmtAxis(k.cached_tokens) }}</td>
+              <td>
+                <div class="hit-cell">
+                  <div class="hit-bar">
+                    <div class="hit-bar-fill" :style="{ width: k.cache_hit_rate + '%', background: hitColor(k.cache_hit_rate) }"></div>
+                  </div>
+                  <span class="hit-val" :style="{ color: hitColor(k.cache_hit_rate) }">{{ k.cache_hit_rate }}%</span>
+                </div>
+              </td>
+              <td>{{ fmtCost(k.cost) }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <EmptyState v-else title="无数据" description="该时间范围内无调用记录" />
+    </DataCard>
   </div>
 </template>
 
@@ -67,6 +103,15 @@ const currency = ref('CNY')
 const metric = ref<'tokens' | 'calls' | 'cost' | 'cache'>('tokens')
 
 const totals = computed(() => data.value?.totals ?? { calls: 0, total_tokens: 0, cached_tokens: 0, cache_hit_rate: 0, cost: 0 })
+
+const byKey = computed(() => data.value?.by_key ?? [])
+
+// 命中率配色：>=85 绿 / >=60 橙 / 其余红
+function hitColor(rate: number) {
+  if (rate >= 85) return '#10b981'
+  if (rate >= 60) return '#f59e0b'
+  return '#ef4444'
+}
 
 // 主趋势图：根据 metric 切换不同维度
 const trendOpt = computed(() => {
@@ -252,5 +297,51 @@ onMounted(load)
 .trend-header {
   display: flex;
   align-items: center;
+}
+.key-table-wrap {
+  overflow-x: auto;
+}
+.key-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.key-table th,
+.key-table td {
+  padding: 8px 12px;
+  text-align: left;
+  border-bottom: 1px solid rgba(128, 128, 128, 0.15);
+  white-space: nowrap;
+}
+.key-table th {
+  color: var(--mtt-text-secondary, #888);
+  font-weight: 500;
+}
+.key-name {
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.hit-cell {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 160px;
+}
+.hit-bar {
+  flex: 1;
+  height: 6px;
+  border-radius: 3px;
+  background: rgba(128, 128, 128, 0.2);
+  overflow: hidden;
+}
+.hit-bar-fill {
+  height: 100%;
+  border-radius: 3px;
+}
+.hit-val {
+  font-variant-numeric: tabular-nums;
+  min-width: 52px;
+  text-align: right;
 }
 </style>

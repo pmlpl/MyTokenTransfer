@@ -116,6 +116,37 @@ async def usage(
         for r in model_rows
     ]
 
+    # 按密钥聚合（含每 key 缓存命中率，便于定位低命中 key / 验证缓存亲和效果）
+    key_stmt = (
+        select(
+            DailyUsage.key_id.label("kid"),
+            func.sum(DailyUsage.calls).label("calls"),
+            func.sum(DailyUsage.prompt_tokens).label("pt"),
+            func.sum(DailyUsage.cached_tokens).label("cached"),
+            func.sum(DailyUsage.cost).label("cost"),
+        )
+        .where(DailyUsage.day >= start, DailyUsage.day <= today)
+        .group_by(DailyUsage.key_id)
+        .order_by(func.sum(DailyUsage.cost).desc())
+    )
+    key_rows = (await db.execute(key_stmt)).all()
+    key_names = {kid: name for kid, name in (await db.execute(select(ApiKey.id, ApiKey.name))).all()}
+    by_key = []
+    for r in key_rows:
+        pt = int(r.pt or 0)
+        cached = int(r.cached or 0)
+        by_key.append(
+            {
+                "key_id": r.kid,
+                "key_name": key_names.get(r.kid) or f"key#{r.kid}",
+                "calls": int(r.calls or 0),
+                "prompt_tokens": pt,
+                "cached_tokens": cached,
+                "cache_hit_rate": round(cached / pt * 100, 2) if pt else 0.0,
+                "cost": float(r.cost or 0),
+            }
+        )
+
     # 汇总
     totals_stmt = select(
         func.sum(DailyUsage.calls).label("calls"),
@@ -134,6 +165,7 @@ async def usage(
         "daily": daily,
         "daily_by_model": daily_by_model,
         "by_model": by_model,
+        "by_key": by_key,
         "totals": {
             "calls": int(t.calls or 0),
             "total_tokens": total_tokens,

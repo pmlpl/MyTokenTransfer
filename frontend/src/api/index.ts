@@ -115,6 +115,7 @@ export interface UsageResp {
   daily: { date: string; calls: number; prompt_tokens: number; completion_tokens: number; total_tokens: number; cached_tokens: number; cost: number }[]
   daily_by_model: { date: string; model: string; total_tokens: number; cost: number }[]
   by_model: { model: string; calls: number; total_tokens: number; cost: number }[]
+  by_key: { key_id: number | null; key_name: string; calls: number; prompt_tokens: number; cached_tokens: number; cache_hit_rate: number; cost: number }[]
   totals: { calls: number; total_tokens: number; cached_tokens: number; cache_hit_rate: number; cost: number }
 }
 

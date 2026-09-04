@@ -23,6 +23,7 @@ from app.relay.balancer import (
     mark_key,
     ordered_keys,
     resolve_native,
+    routing_affinity,
 )
 from app.relay.errors import classify_error
 from app.services.health_check import _join
@@ -45,13 +46,18 @@ def _headers(raw_key: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {raw_key}", "Content-Type": "application/json"}
 
 
-async def _build_attempts(channel: Channel, db: AsyncSession) -> list[tuple[ChannelTier, ApiKey]]:
-    """按 Tier 升序，每层取策略排序后的可用 key（受 max_retries 限）。"""
+async def _build_attempts(
+    channel: Channel, db: AsyncSession, affinity: int = 0
+) -> list[tuple[ChannelTier, ApiKey]]:
+    """按 Tier 升序，每层取策略排序后的可用 key（受 max_retries 限）。
+
+    affinity 为内容哈希：同一会话固定同一 key，最大化上游前缀缓存命中。
+    """
     max_retries = max(1, channel.max_retries)
     tiers = sorted(channel.tiers, key=lambda t: t.order)
     attempts: list[tuple[ChannelTier, ApiKey]] = []
     for tier in tiers:
-        keys = await ordered_keys(tier, channel.strategy, db)
+        keys = await ordered_keys(tier, channel.strategy, db, affinity)
         for k in keys[:max_retries]:
             attempts.append((tier, k))
     return attempts
@@ -69,8 +75,10 @@ async def route_chat_completions(
 ) -> JSONResponse | StreamingResponse:
     virtual = channel.virtual_model
     stream = bool(body.get("stream"))
+    # 缓存亲和：由虚拟模型 + 消息稳定前缀派生路由哈希，同一会话固定同一 key
+    affinity = routing_affinity(virtual, body)
 
-    attempts = await _build_attempts(channel, db)
+    attempts = await _build_attempts(channel, db, affinity)
     if not attempts:
         log.warning("no_available_key", channel_id=channel.id, virtual_model=virtual)
         return _no_key_response()
@@ -240,8 +248,10 @@ async def route_embeddings(channel: Channel, body: dict, db: AsyncSession) -> JS
     与 chat 不同的是：embeddings 不支持流式，响应 usage 仅含 prompt/total tokens。
     """
     virtual = channel.virtual_model
+    # 缓存亲和：embeddings 按 input 前缀派生路由哈希
+    affinity = routing_affinity(virtual, body)
 
-    attempts = await _build_attempts(channel, db)
+    attempts = await _build_attempts(channel, db, affinity)
     if not attempts:
         log.warning("no_available_key", channel_id=channel.id, virtual_model=virtual)
         return _no_key_response()
