@@ -138,7 +138,7 @@ async def usage(
         by_key.append(
             {
                 "key_id": r.kid,
-                "key_name": key_names.get(r.kid) or f"key#{r.kid}",
+                "key_name": key_names.get(r.kid) or (f"key#{r.kid}" if r.kid is not None else "未知"),
                 "calls": int(r.calls or 0),
                 "prompt_tokens": pt,
                 "cached_tokens": cached,
