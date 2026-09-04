@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import structlog
+from datetime import datetime, timedelta, timezone
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from sqlalchemy import select
@@ -15,17 +16,30 @@ scheduler = AsyncIOScheduler()
 
 # 巡检间隔（分钟）
 SWEEP_INTERVAL_MINUTES = 10
+# exhausted 状态密钥的最小重测间隔（分钟），避免频繁命中 429 quota
+EXHAUSTED_RETEST_MINUTES = 60
 
 
 async def sweep_degraded_keys() -> None:
-    """周期巡检：重测所有非 active 的密钥，恢复成功的转回 active。"""
+    """周期巡检：重测所有非 active 的密钥，恢复成功的转回 active。
+
+    exhausted 状态的密钥距上次测试不足 EXHAUSTED_RETEST_MINUTES 则跳过，
+    避免频繁命中上游 429 quota。
+    """
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
     async with AsyncSessionLocal() as db:
-        rows = await db.execute(select(ApiKey).where(ApiKey.status != KeyStatus.active))
+        rows = await db.execute(select(ApiKey).where(ApiKey.status.not_in([KeyStatus.active, KeyStatus.disabled])))
         keys = list(rows.scalars())
         if not keys:
             return
         recovered = 0
+        skipped_exhausted = 0
         for key in keys:
+            # exhausted 密钥延长巡检间隔
+            if key.status == KeyStatus.exhausted and key.last_tested_at is not None:
+                if (now - key.last_tested_at) < timedelta(minutes=EXHAUSTED_RETEST_MINUTES):
+                    skipped_exhausted += 1
+                    continue
             before = key.status
             try:
                 await test_key(db, key)
@@ -34,7 +48,8 @@ async def sweep_degraded_keys() -> None:
                 continue
             if before != KeyStatus.active and key.status == KeyStatus.active:
                 recovered += 1
-        log.info("sweep_done", total=len(keys), recovered=recovered)
+        log.info("sweep_done", total=len(keys), tested=len(keys) - skipped_exhausted,
+                 skipped_exhausted=skipped_exhausted, recovered=recovered)
 
 
 async def rollup_yesterday() -> None:

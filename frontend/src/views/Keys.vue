@@ -32,7 +32,7 @@
           @update:value="load"
         />
         <n-button size="small" type="primary" :loading="testing" @click="onBatchTest">
-          批量健康测试
+          {{ testing ? `测试中 ${batchProgress.done}/${batchProgress.total}` : '批量健康测试' }}
         </n-button>
       </template>
 
@@ -154,10 +154,11 @@ const providers = ref<Provider[]>([])
 const groups = ref<KeyGroup[]>([])
 const loading = ref(false)
 const testing = ref(false)
+const batchProgress = reactive({ done: 0, total: 0 })
 const message = useMessage()
 const nDialog = useDialog() // Naive UI dialog API；避免与下面 reactive 同名
 
-const filter = reactive<{ provider_id?: number; status?: string }>({})
+const filter = reactive<{ provider_id?: number; group_id?: number; status?: string }>({})
 
 const providerOptions = computed<SelectOption[]>(() =>
   providers.value.map((p) => ({ label: p.name, value: p.id })),
@@ -208,6 +209,7 @@ const statusTextMap: Record<string, string> = {
 }
 
 const columns: DataTableColumns<KeyRow> = [
+  { title: 'ID', key: 'id', width: 60 },
   { title: '名称', key: 'name', minWidth: 120 },
   { title: '供应商', key: 'provider_name', width: 110 },
   { title: '账号', key: 'account_label', width: 120 },
@@ -362,8 +364,10 @@ async function onTest(row: KeyRow) {
   row._testing = true
   try {
     const r = await api.keys.test(row.id)
-    if (r.ok) {
-      message.success('测试通过')
+    if (r.ok && r.state_changed) {
+      message.success('测试通过，状态已恢复')
+    } else if (r.ok && !r.state_changed) {
+      message.warning('探测通过但仍在冷却/保护期，状态暂未变更（1-token 请求无法验证大请求是否限流）')
     } else {
       message.error(`失败：${r.error || ''}`)
     }
@@ -376,20 +380,56 @@ async function onTest(row: KeyRow) {
 }
 
 async function onBatchTest() {
+  // 先拉取当前过滤条件下的密钥列表，排除已停用
+  const all = await api.keys.list({ provider_id: filter.provider_id, group_id: filter.group_id })
+  const targets = all.filter((k) => k.status !== 'disabled')
+  if (targets.length === 0) {
+    message.warning('没有可测试的密钥（已停用的密钥跳过）')
+    return
+  }
   testing.value = true
-  try {
-    const results = await api.keys.testBatch(filter)
-    const ok = results.filter((r: any) => r.ok).length
-    const fail = results.length - ok
-    // 修复原"全坏也绿"bug：按 ok/fail 比例选择提示级别
-    if (fail === 0) {
-      message.success(`批量测试完成：${ok}/${results.length} 全部可用`)
-    } else if (ok === 0) {
-      message.error(`批量测试完成：${ok}/${results.length} 全部失败`)
-    } else {
-      message.warning(`批量测试完成：${ok}/${results.length} 可用，${fail} 失败`)
+  batchProgress.done = 0
+  batchProgress.total = targets.length
+  let recovered = 0   // 探测成功且状态恢复为 active
+  let grace = 0       // 探测成功但仍在保护期，状态未变
+  let fail = 0
+
+  // 并发度 5，逐个调用单 key 测试接口以实时反馈进度
+  const concurrency = 5
+  const queue = [...targets]
+  async function worker() {
+    while (queue.length > 0) {
+      const row = queue.shift()!
+      const idx = keys.value.findIndex((k) => k.id === row.id)
+      if (idx >= 0) keys.value[idx]._testing = true
+      try {
+        const r = await api.keys.test(row.id)
+        if (r.ok && r.state_changed) recovered++
+        else if (r.ok && !r.state_changed) grace++
+        else fail++
+      } catch {
+        fail++
+      } finally {
+        if (idx >= 0) keys.value[idx]._testing = false
+        batchProgress.done++
+      }
     }
+  }
+  try {
+    await Promise.all(Array.from({ length: Math.min(concurrency, targets.length) }, () => worker()))
     await load()
+    const parts: string[] = []
+    if (recovered > 0) parts.push(`${recovered} 已恢复`)
+    if (grace > 0) parts.push(`${grace} 探测通过但保护期内未恢复`)
+    if (fail > 0) parts.push(`${fail} 失败`)
+    const summary = parts.join('，') || '无变化'
+    if (fail === 0 && grace === 0) {
+      message.success(`批量测试完成：${summary}`)
+    } else if (recovered === 0 && grace === 0) {
+      message.error(`批量测试完成：${summary}`)
+    } else {
+      message.warning(`批量测试完成：${summary}`)
+    }
   } catch {
     // 拦截器已提示
   } finally {

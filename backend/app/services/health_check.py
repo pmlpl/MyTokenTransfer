@@ -10,6 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import decrypt_value
+from app.database import AsyncSessionLocal
 from app.models import ApiKey, KeyStatus, Provider
 from app.models.enums import ProbeKind
 from app.relay.errors import classify_error
@@ -23,6 +24,11 @@ _DEFAULT_BASES = {
 
 # 限流冷却时长（秒）
 _RATE_LIMIT_COOLDOWN = 60
+
+# 非 active 状态的探测成功保护期（分钟）。
+# 1-token 探测太轻量，刚被标记为 degraded 的 key 可能小请求能过但大请求仍限流，
+# 保护期内探测成功不恢复 active，避免状态反复横跳。
+_DEGRADED_PROBE_GRACE_MINUTES = 5
 
 # 网络层瞬时故障重试（容器 NAT 到部分上游端点偶发 TLS 握手超时/连接重置）
 _PROBE_ATTEMPTS = 3
@@ -124,6 +130,33 @@ async def _probe_chat(base: str, headers: dict[str, str], model: str) -> ProbeRe
     )
 
 
+async def _probe_anthropic_chat(base: str, headers: dict[str, str], model: str) -> ProbeResult:
+    """用 Anthropic Messages API 做最小对话兜底探测（1 token 成本）。"""
+    url = _join(base, "messages")
+    payload = {
+        "model": model,
+        "max_tokens": 1,
+        "messages": [{"role": "user", "content": "ping"}],
+    }
+    try:
+        resp = await _request_with_retry(
+            "POST",
+            url,
+            headers={**headers, "Content-Type": "application/json"},
+            json_body=payload,
+            timeout=20.0,
+        )
+    except Exception as e:
+        return ProbeResult(False, None, None, f"{type(e).__name__}: {e}", via="chat")
+
+    if resp.status_code == 200:
+        return ProbeResult(True, 200, None, None, via="chat")
+    snippet = resp.text[:200] if resp.text else ""
+    return ProbeResult(
+        False, resp.status_code, None, f"HTTP {resp.status_code}: {snippet}", via="chat", body=snippet
+    )
+
+
 async def _probe(provider: Provider, raw_key: str) -> ProbeResult:
     base = provider.base_url or _DEFAULT_BASES.get(provider.slug, "")
     if not base:
@@ -149,7 +182,13 @@ async def _probe(provider: Provider, raw_key: str) -> ProbeResult:
         result = await _probe_models(base, headers)
         if result is not None:
             return result
-        return ProbeResult(False, None, None, "Anthropic 探测失败")
+        # 列模型接口不可用（Anthropic 官方无 /models），fallback 到最小对话
+        model = _first_model(provider)
+        if not model:
+            return ProbeResult(
+                False, None, None, "Anthropic 列模型接口不可用，请在供应商配置中填写模型列表以启用对话兜底探测"
+            )
+        return await _probe_anthropic_chat(base, headers, model)
 
     if provider.probe_kind == ProbeKind.gemini_models:
         url = f"{base.rstrip('/')}/v1beta/models?key={raw_key}"
@@ -168,16 +207,33 @@ async def _probe(provider: Provider, raw_key: str) -> ProbeResult:
 
 
 def _classify(
-    result: ProbeResult, current: KeyStatus
+    result: ProbeResult,
+    current: KeyStatus,
+    rate_limited_until: datetime | None = None,
+    last_tested_at: datetime | None = None,
 ) -> tuple[KeyStatus, str | None, datetime | None]:
     """根据探针结果决定新状态/错误/冷却到期。
 
     复用 relay.errors.classify_error，与健康路径保持一致：
     429 带 quota 关键词 → exhausted（额度用尽，靠巡检恢复，不设冷却）；
     纯 429 → rate_limited + 短冷却；401/403 → invalid。
+
+    探测成功保护：1-token 探测太轻量，刚被标记为 degraded 的 key 可能小请求
+    能过但大请求仍限流。rate_limited 冷却未到期、或 exhausted 在保护期内时，
+    探测成功不恢复 active，避免状态反复横跳。
     """
+    # 手动停用的 key 不被探测自动恢复
+    if current == KeyStatus.disabled:
+        return current, result.error, None
     now = _now()
     if result.ok:
+        # rate_limited 冷却未到期：1-token 成功不代表限流解除，保留冷却
+        if current == KeyStatus.rate_limited and rate_limited_until and rate_limited_until > now:
+            return current, None, rate_limited_until
+        # exhausted 保护期内：刚被标记为额度用尽，1-token 成功可能是请求太小
+        if current == KeyStatus.exhausted and last_tested_at:
+            if (now - last_tested_at) < timedelta(minutes=_DEGRADED_PROBE_GRACE_MINUTES):
+                return current, None, None
         return KeyStatus.active, None, None
     if result.http_status is None:
         # 网络层/配置错误：瞬时，保留原状态，记录原始错误
@@ -198,9 +254,11 @@ def _now() -> datetime:
 
 async def test_key(db: AsyncSession, key: ApiKey) -> dict:
     """探测单条密钥并更新状态。"""
-    from app.services.alerts import emit_key_alert
+    from app.services.alerts import emit_key_alert, resolve_key_alerts
 
     before = key.status
+    if key.status == KeyStatus.disabled:
+        return {"id": key.id, "status": key.status.value, "ok": False, "error": "密钥已手动停用，跳过探测"}
     try:
         raw = decrypt_value(key.key_value)
     except Exception:
@@ -220,7 +278,7 @@ async def test_key(db: AsyncSession, key: ApiKey) -> dict:
         return {"id": key.id, "status": key.status.value, "ok": False, "error": key.last_error}
 
     result = await _probe(key.provider, raw)
-    new_status, err, rlu = _classify(result, key.status)
+    new_status, err, rlu = _classify(result, key.status, key.rate_limited_until, key.last_tested_at)
     key.status = new_status
     key.last_error = err
     key.rate_limited_until = rlu
@@ -234,6 +292,9 @@ async def test_key(db: AsyncSession, key: ApiKey) -> dict:
         after=new_status,
         message=err or "健康探测失败",
     )
+    # key 从非 active 恢复为 active → 自动 resolve 其历史未解决告警
+    if new_status == KeyStatus.active and before != KeyStatus.active:
+        await resolve_key_alerts(db, key.id)
     await db.commit()
     return {
         "id": key.id,
@@ -242,7 +303,12 @@ async def test_key(db: AsyncSession, key: ApiKey) -> dict:
         "error": err,
         "http_status": result.http_status,
         "via": result.via,
+        "state_changed": before != key.status,
     }
+
+
+# 批量探测并发度（避免对上游同时打太多请求）
+_BATCH_CONCURRENCY = 5
 
 
 async def test_keys(
@@ -250,16 +316,24 @@ async def test_keys(
     provider_id: int | None = None,
     group_id: int | None = None,
 ) -> list[dict]:
-    """批量探测密钥。"""
-    stmt = select(ApiKey)
+    """批量探测密钥（并发，跳过已手动停用的 key）。"""
+    stmt = select(ApiKey).where(ApiKey.status != KeyStatus.disabled)
     if provider_id is not None:
         stmt = stmt.where(ApiKey.provider_id == provider_id)
     if group_id is not None:
         stmt = stmt.where(ApiKey.group_id == group_id)
     result = await db.execute(stmt.order_by(ApiKey.id))
-    keys = list(result.scalars())
+    key_ids = [k.id for k in result.scalars()]
 
-    results: list[dict] = []
-    for key in keys:
-        results.append(await test_key(db, key))
-    return results
+    sem = asyncio.Semaphore(_BATCH_CONCURRENCY)
+
+    async def _test_one(kid: int) -> dict:
+        async with sem:
+            async with AsyncSessionLocal() as sdb:
+                k = await sdb.get(ApiKey, kid)
+                if not k:
+                    return {"id": kid, "status": "unknown", "ok": False, "error": "密钥不存在"}
+                return await test_key(sdb, k)
+
+    results = await asyncio.gather(*[_test_one(kid) for kid in key_ids])
+    return list(results)
