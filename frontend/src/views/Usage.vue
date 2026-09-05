@@ -45,9 +45,9 @@
       </div>
     </div>
 
-    <!-- 趋势分析：维度切换 -->
+    <!-- 趋势分析：维度切换（segment 放卡片头 flex 槽会宽度塌陷，故置于内容区顶部） -->
     <DataCard title="趋势分析">
-      <template #actions>
+      <div class="card-tabs trend-tabs">
         <n-tabs v-model:value="metric" type="segment" size="small">
           <n-tab-pane name="tokens" tab="Tokens" />
           <n-tab-pane name="calls" tab="请求数" />
@@ -55,8 +55,8 @@
           <n-tab-pane name="cache" tab="缓存命中" />
           <n-tab-pane name="model" tab="按模型" />
         </n-tabs>
-      </template>
-      <div v-if="metric === 'model'" class="model-metric-switch">
+      </div>
+      <div v-if="metric === 'model'" class="card-tabs model-tabs">
         <n-tabs v-model:value="modelMetric" type="segment" size="small">
           <n-tab-pane name="tokens" tab="总 Tokens" />
           <n-tab-pane name="calls" tab="请求数" />
@@ -69,12 +69,12 @@
 
     <!-- 用量明细：按密钥 / 按模型 Tab 切换 -->
     <DataCard title="用量明细">
-      <template #actions>
-        <n-tabs v-model:value="detailTab" type="segment" size="small" class="detail-tabs">
+      <div class="card-tabs detail-tabs">
+        <n-tabs v-model:value="detailTab" type="segment" size="small">
           <n-tab-pane name="key" tab="按密钥" />
           <n-tab-pane name="model" tab="按模型" />
         </n-tabs>
-      </template>
+      </div>
 
       <!-- 按密钥 -->
       <template v-if="detailTab === 'key'">
@@ -548,8 +548,16 @@ onMounted(load)
   flex-direction: column;
   gap: 16px;
 }
-.model-metric-switch {
-  margin-bottom: 8px;
+/* 卡片内 segment 切换条：限宽避免铺满整行，与图表留间距 */
+.card-tabs {
+  margin-bottom: 12px;
+}
+.trend-tabs :deep(.n-tabs),
+.model-tabs :deep(.n-tabs) {
+  max-width: 520px;
+}
+.detail-tabs :deep(.n-tabs) {
+  max-width: 280px;
 }
 .kpi-grid {
   display: grid;
