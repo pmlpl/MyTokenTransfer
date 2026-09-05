@@ -223,6 +223,27 @@ async def last_resort_keys(
     return keys[: max(1, limit)]
 
 
+async def final_resort_keys(
+    tier: ChannelTier,
+    db: AsyncSession,
+    limit: int,
+) -> list[ApiKey]:
+    """tier TPM 冷却期的最终兜底：层内全部密钥（仅排除 invalid）。
+
+    高并发客户端（爬虫类）能把整池打到 429 → 整层 60 秒冷却，此时前面
+    各级兜底都被 tier 冷却守卫跳过，请求直接 503。TPM 窗口按分钟滚动，
+    冷却尾部的最后尝试常能成功，代价只是再吃一次快速 429。
+    """
+    rows = await db.execute(select(ChannelKey).where(ChannelKey.channel_tier_id == tier.id))
+    keys: list[ApiKey] = []
+    for ck in rows.scalars():
+        ak = await db.get(ApiKey, ck.key_id)
+        if ak and ak.status != KeyStatus.invalid:
+            keys.append(ak)
+    keys.sort(key=lambda k: (k.last_tested_at or datetime.min, k.id))
+    return keys[: max(1, limit)]
+
+
 async def mark_key(
     key: ApiKey,
     status: KeyStatus | None,

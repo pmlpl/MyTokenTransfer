@@ -20,6 +20,7 @@ from app.models import ApiKey, Channel, ChannelTier, KeyStatus
 from app.relay.accounting import write_call_log
 from app.relay.balancer import (
     base_url_for,
+    final_resort_keys,
     last_resort_keys,
     mark_key,
     mark_model_quota_limited,
@@ -149,6 +150,13 @@ async def _build_attempts(
             for k in keys[:max_retries]:
                 if model_quota_is_limited(k.id, virtual):
                     attempts.append((tier, k))
+    # 最终兜底：所有层都在 tier TPM 冷却时（高并发客户端瞬时打满共享
+    # TPM → 整层 60 秒冷却，各级兜底全被守卫跳过），无视冷却标记取层内
+    # 密钥试最后一轮；503 前的最后一搏，窗口滚动后这一把常能成功。
+    if not attempts:
+        for tier in tiers:
+            for k in await final_resort_keys(tier, db, max_retries):
+                attempts.append((tier, k))
     if attempts and all(k.status != KeyStatus.active for _, k in attempts):
         log.warning("no_active_key_last_resort", channel_id=channel.id,
                     virtual_model=channel.virtual_model, exhausted_attempts=len(attempts))
@@ -186,12 +194,16 @@ async def route_chat_completions(
 
     last_error = "无可用上游"
     # attempts 全部带着模型池冷却标记时（兜底场景）不跳过，否则兜底白加；
-    # 存在无冷却组合时仍跳过冷却中的，避免浪费重试次数
+    # 存在无冷却组合时仍跳过冷却中的，避免浪费重试次数。tier 冷却同理：
+    # 最终兜底拿到的组合全部处于整层冷却时豁免守卫。
     allow_quota_limited = bool(attempts) and all(
         model_quota_is_limited(k.id, virtual) for _, k in attempts
     )
+    allow_tier_limited = bool(attempts) and all(
+        tier_is_rate_limited(t.id) for t, _ in attempts
+    )
     for tier, key in attempts:
-        if tier_is_rate_limited(tier.id):
+        if tier_is_rate_limited(tier.id) and not allow_tier_limited:
             continue  # 同池短路：该层已在本次请求内被标记 TPM 冷却
         if model_quota_is_limited(key.id, virtual) and not allow_quota_limited:
             continue  # 模型池冷却：该 key 上本模型的积分池刚报 429
@@ -386,8 +398,11 @@ async def route_embeddings(channel: Channel, body: dict, db: AsyncSession) -> JS
     allow_quota_limited = bool(attempts) and all(
         model_quota_is_limited(k.id, virtual) for _, k in attempts
     )
+    allow_tier_limited = bool(attempts) and all(
+        tier_is_rate_limited(t.id) for t, _ in attempts
+    )
     for tier, key in attempts:
-        if tier_is_rate_limited(tier.id):
+        if tier_is_rate_limited(tier.id) and not allow_tier_limited:
             continue  # 同池短路：该层已被标记 TPM 冷却
         if model_quota_is_limited(key.id, virtual) and not allow_quota_limited:
             continue  # 模型池冷却：该 key 上本模型的积分池刚报 429
