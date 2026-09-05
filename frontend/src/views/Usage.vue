@@ -48,20 +48,20 @@
     <!-- 趋势分析：维度切换（segment 放卡片头 flex 槽会宽度塌陷，故置于内容区顶部） -->
     <DataCard title="趋势分析">
       <div class="card-tabs trend-tabs">
-        <n-tabs v-model:value="metric" type="segment" size="small">
-          <n-tab-pane name="tokens" tab="Tokens" />
-          <n-tab-pane name="calls" tab="请求数" />
-          <n-tab-pane name="cost" tab="成本" />
-          <n-tab-pane name="cache" tab="缓存命中" />
-          <n-tab-pane name="model" tab="按模型" />
-        </n-tabs>
+        <n-radio-group v-model:value="metric" size="small">
+          <n-radio-button value="tokens">Tokens</n-radio-button>
+          <n-radio-button value="calls">请求数</n-radio-button>
+          <n-radio-button value="cost">成本</n-radio-button>
+          <n-radio-button value="cache">缓存命中</n-radio-button>
+          <n-radio-button value="model">按模型</n-radio-button>
+        </n-radio-group>
       </div>
       <div v-if="metric === 'model'" class="card-tabs model-tabs">
-        <n-tabs v-model:value="modelMetric" type="segment" size="small">
-          <n-tab-pane name="tokens" tab="总 Tokens" />
-          <n-tab-pane name="calls" tab="请求数" />
-          <n-tab-pane name="cost" tab="成本" />
-        </n-tabs>
+        <n-radio-group v-model:value="modelMetric" size="small">
+          <n-radio-button value="tokens">总 Tokens</n-radio-button>
+          <n-radio-button value="calls">请求数</n-radio-button>
+          <n-radio-button value="cost">成本</n-radio-button>
+        </n-radio-group>
       </div>
       <v-chart v-if="trendOpt" :option="trendOpt" autoresize style="height: 360px" />
       <EmptyState v-else title="无数据" description="该时间范围内无调用记录" />
@@ -70,10 +70,10 @@
     <!-- 用量明细：按密钥 / 按模型 Tab 切换 -->
     <DataCard title="用量明细">
       <div class="card-tabs detail-tabs">
-        <n-tabs v-model:value="detailTab" type="segment" size="small">
-          <n-tab-pane name="key" tab="按密钥" />
-          <n-tab-pane name="model" tab="按模型" />
-        </n-tabs>
+        <n-radio-group v-model:value="detailTab" size="small">
+          <n-radio-button value="key">按密钥</n-radio-button>
+          <n-radio-button value="model">按模型</n-radio-button>
+        </n-radio-group>
       </div>
 
       <!-- 按密钥 -->
@@ -112,7 +112,7 @@ import { CanvasRenderer } from 'echarts/renderers'
 import { BarChart, LineChart } from 'echarts/charts'
 import { GridComponent, TooltipComponent, LegendComponent } from 'echarts/components'
 import VChart from 'vue-echarts'
-import { NButton, NRadioGroup, NRadioButton, NTabs, NTabPane, NDataTable, type DataTableColumns } from 'naive-ui'
+import { NButton, NRadioGroup, NRadioButton, NDataTable, type DataTableColumns } from 'naive-ui'
 import { api, type UsageResp } from '@/api'
 import PageHeader from '@/design/components/PageHeader.vue'
 import DataCard from '@/design/components/DataCard.vue'
@@ -548,16 +548,9 @@ onMounted(load)
   flex-direction: column;
   gap: 16px;
 }
-/* 卡片内 segment 切换条：限宽避免铺满整行，与图表留间距 */
+/* 卡片内切换条与图表留间距；radio 按钮宽度自适应文字，无需限宽 */
 .card-tabs {
   margin-bottom: 12px;
-}
-.trend-tabs :deep(.n-tabs),
-.model-tabs :deep(.n-tabs) {
-  max-width: 520px;
-}
-.detail-tabs :deep(.n-tabs) {
-  max-width: 280px;
 }
 .kpi-grid {
   display: grid;
