@@ -103,6 +103,8 @@ export interface Pricing {
   input_price: number
   cached_input_price: number
   output_price: number
+  off_peak_input_price: number
+  off_peak_output_price: number
   context_length: number
   currency: string
   note: string | null

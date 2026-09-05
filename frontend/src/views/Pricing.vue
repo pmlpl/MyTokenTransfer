@@ -58,6 +58,15 @@
         <n-form-item label="输出价/1M">
           <n-input-number v-model:value="form.output_price" :min="0" :step="0.1" :precision="6" style="width: 100%" />
         </n-form-item>
+        <n-form-item label="空闲输入价/1M">
+          <n-input-number v-model:value="form.off_peak_input_price" :min="0" :step="0.1" :precision="6" style="width: 100%" placeholder="0=沿用标准价" />
+        </n-form-item>
+        <n-form-item label="空闲输出价/1M">
+          <n-input-number v-model:value="form.off_peak_output_price" :min="0" :step="0.1" :precision="6" style="width: 100%" placeholder="0=沿用标准价" />
+        </n-form-item>
+        <n-form-item label=" ">
+          <span style="font-size: 12px; color: var(--n-text-color-3, #999)">空闲时段为北京时间 00:30–08:30，折扣价仅该时段生效；无分时定价的模型保持 0 即可</span>
+        </n-form-item>
         <n-form-item label="币种">
           <n-select v-model:value="form.currency" :options="currencyOptions" />
         </n-form-item>
@@ -116,7 +125,15 @@ const dialog = reactive<{ visible: boolean; id: number | null; saving: boolean }
   id: null,
   saving: false,
 })
-const form = reactive({ model_name: '', input_price: 0, cached_input_price: 0, output_price: 0, context_length: 0, currency: 'CNY', note: '' })
+const form = reactive({ model_name: '', input_price: 0, cached_input_price: 0, output_price: 0, off_peak_input_price: 0, off_peak_output_price: 0, context_length: 0, currency: 'CNY', note: '' })
+
+// 空闲档价格人读格式：两档都为 0（未设置）显示 "—"，否则 "输入 x / 输出 y"
+function fmtOffPeak(row: Pricing): string {
+  const i = Number(row.off_peak_input_price ?? 0)
+  const o = Number(row.off_peak_output_price ?? 0)
+  if (!i && !o) return '—'
+  return `输入 ${i} / 输出 ${o}`
+}
 
 // 上下文长度人读格式：0=未设置，>=1M 显示 "1M"，>=1K 显示 "128K"，否则原样
 function fmtContext(n: number): string {
@@ -145,6 +162,12 @@ const columns: DataTableColumns<Pricing> = [
     key: 'output_price',
     width: 150,
     render: (row) => `${row.output_price} ${row.currency}`,
+  },
+  {
+    title: '空闲档 / 1M',
+    key: 'off_peak_prices',
+    width: 180,
+    render: (row) => fmtOffPeak(row),
   },
   {
     title: '上下文',
@@ -253,7 +276,7 @@ const costOpt = computed(() => {
 
 function openAdd() {
   dialog.id = null
-  Object.assign(form, { model_name: '', input_price: 0, cached_input_price: 0, output_price: 0, context_length: 0, currency: 'CNY', note: '' })
+  Object.assign(form, { model_name: '', input_price: 0, cached_input_price: 0, output_price: 0, off_peak_input_price: 0, off_peak_output_price: 0, context_length: 0, currency: 'CNY', note: '' })
   dialog.visible = true
 }
 
@@ -264,6 +287,8 @@ function openEdit(row: Pricing) {
     input_price: row.input_price,
     cached_input_price: row.cached_input_price,
     output_price: row.output_price,
+    off_peak_input_price: row.off_peak_input_price,
+    off_peak_output_price: row.off_peak_output_price,
     context_length: row.context_length,
     currency: row.currency,
     note: row.note || '',
@@ -283,6 +308,8 @@ async function onSave() {
         input_price: form.input_price,
         cached_input_price: form.cached_input_price,
         output_price: form.output_price,
+        off_peak_input_price: form.off_peak_input_price,
+        off_peak_output_price: form.off_peak_output_price,
         context_length: form.context_length,
         currency: form.currency,
         note: form.note,

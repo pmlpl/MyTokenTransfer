@@ -4,16 +4,27 @@
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, time, timedelta, timezone
 
 from sqlalchemy import select
 
 from app.database import AsyncSessionLocal
 from app.models import CallLog, ModelPricing
 
+# 空闲时段（北京时间 00:30–08:30，含头不含尾）：DeepSeek 官方按此时段给折扣价。
+# 价表里空闲价填 0 表示该模型无分时定价，全天按标准价计费。
+_OFF_PEAK_START = time(0, 30)
+_OFF_PEAK_END = time(8, 30)
+
 
 def _now() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _in_off_peak(now_utc: datetime) -> bool:
+    """UTC 时间换算北京时间后判断是否落在空闲时段（窗口跨午夜，直接比较 time）。"""
+    bj = now_utc + timedelta(hours=8)
+    return _OFF_PEAK_START <= bj.time() < _OFF_PEAK_END
 
 
 async def write_call_log(
@@ -50,10 +61,17 @@ async def write_call_log(
             )
             if p is not None:
                 uncached = max(0, pt - cached)
+                # 空闲时段用折扣价；某档空闲价未填（0）则沿用标准价
+                if _in_off_peak(_now()):
+                    in_price = float(p.off_peak_input_price) or float(p.input_price)
+                    out_price = float(p.off_peak_output_price) or float(p.output_price)
+                else:
+                    in_price = float(p.input_price)
+                    out_price = float(p.output_price)
                 cost = round(
                     cached * float(p.cached_input_price) / 1_000_000
-                    + uncached * float(p.input_price) / 1_000_000
-                    + ct * float(p.output_price) / 1_000_000,
+                    + uncached * in_price / 1_000_000
+                    + ct * out_price / 1_000_000,
                     6,
                 )
         s.add(
