@@ -4,12 +4,12 @@ from collections import Counter
 from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import require_auth
 from app.database import get_db
-from app.models import ApiKey, DailyUsage, KeyStatus, Provider
+from app.models import ApiKey, CallLog, DailyUsage, KeyStatus, Provider
 from app.services.usage import rollup_date
 
 router = APIRouter(
@@ -170,8 +170,75 @@ async def usage(
     # 缓存命中率 = cached_tokens / prompt_tokens（缓存命中发生在输入侧）
     prompt_sum = sum(d["prompt_tokens"] for d in daily)
     cache_hit_rate = round(cached_tokens / prompt_sum * 100, 2) if prompt_sum > 0 else 0.0
+
+    # 今日视图：从 call_logs 按北京时间（UTC+8）小时聚合，用于波形图
+    hourly = []
+    hourly_by_model = []
+    if days == 1:
+        # 北京时间今日 00:00 对应 UTC 昨日 16:00
+        beijing_today = (datetime.now(timezone.utc) + timedelta(hours=8)).date()
+        day_start = datetime.combine(beijing_today, datetime.min.time()) - timedelta(hours=8)
+        day_end = day_start + timedelta(days=1)
+        model_field = func.coalesce(func.nullif(CallLog.native_model, ""), CallLog.virtual_model)
+        # 北京时间小时 = HOUR(created_at + INTERVAL 8 HOUR)
+        hour_expr = func.hour(func.date_add(CallLog.created_at, text("INTERVAL 8 HOUR")))
+
+        # 按小时聚合
+        h_stmt = (
+            select(
+                hour_expr.label("hr"),
+                func.count(CallLog.id).label("calls"),
+                func.sum(CallLog.prompt_tokens).label("pt"),
+                func.sum(CallLog.completion_tokens).label("ct"),
+                func.sum(CallLog.total_tokens).label("tt"),
+                func.sum(CallLog.cached_tokens).label("cached"),
+                func.sum(CallLog.cost).label("cost"),
+            )
+            .where(CallLog.created_at >= day_start, CallLog.created_at < day_end)
+            .group_by(hour_expr)
+            .order_by(hour_expr)
+        )
+        h_rows = (await db.execute(h_stmt)).all()
+        h_map = {int(r.hr): r for r in h_rows}
+        for hr in range(24):
+            r = h_map.get(hr)
+            hourly.append({
+                "hour": hr,
+                "calls": int(r.calls or 0) if r else 0,
+                "prompt_tokens": int(r.pt or 0) if r else 0,
+                "completion_tokens": int(r.ct or 0) if r else 0,
+                "total_tokens": int(r.tt or 0) if r else 0,
+                "cached_tokens": int(r.cached or 0) if r else 0,
+                "cost": float(r.cost or 0) if r else 0.0,
+            })
+
+        # 按小时×模型聚合
+        hbm_stmt = (
+            select(
+                hour_expr.label("hr"),
+                model_field.label("m"),
+                func.sum(CallLog.total_tokens).label("tt"),
+                func.sum(CallLog.cost).label("cost"),
+            )
+            .where(CallLog.created_at >= day_start, CallLog.created_at < day_end)
+            .group_by(hour_expr, model_field)
+            .order_by(hour_expr)
+        )
+        hbm_rows = (await db.execute(hbm_stmt)).all()
+        hourly_by_model = [
+            {
+                "hour": int(r.hr),
+                "model": str(r.m or "未知"),
+                "total_tokens": int(r.tt or 0),
+                "cost": float(r.cost or 0),
+            }
+            for r in hbm_rows
+        ]
+
     return {
         "days": days,
+        "hourly": hourly,
+        "hourly_by_model": hourly_by_model,
         "daily": daily,
         "daily_by_model": daily_by_model,
         "by_model": by_model,
