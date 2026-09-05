@@ -137,6 +137,18 @@ async def _build_attempts(
             continue
         for k in await last_resort_keys(tier, db, max_retries):
             attempts.append((tier, k))
+    # 全池模型池冷却兜底：小池子（如 deepseek 仅 2 把 key）在所有 key 的
+    # (key,模型) 积分池同时进入 300 秒冷却时，上面产出空 attempts 会直接
+    # 503。积分池按窗口滚动、恢复常快于冷却期，追加冷却中的组合做最后
+    # 尝试，失败代价只是再吃一次快速 429，与 exhausted 兜底同理。
+    if not attempts:
+        for tier in tiers:
+            if tier_is_rate_limited(tier.id):
+                continue
+            keys = await ordered_keys(tier, channel.strategy, db, affinity)
+            for k in keys[:max_retries]:
+                if model_quota_is_limited(k.id, virtual):
+                    attempts.append((tier, k))
     if attempts and all(k.status != KeyStatus.active for _, k in attempts):
         log.warning("no_active_key_last_resort", channel_id=channel.id,
                     virtual_model=channel.virtual_model, exhausted_attempts=len(attempts))
@@ -173,10 +185,15 @@ async def route_chat_completions(
         return _no_key_response()
 
     last_error = "无可用上游"
+    # attempts 全部带着模型池冷却标记时（兜底场景）不跳过，否则兜底白加；
+    # 存在无冷却组合时仍跳过冷却中的，避免浪费重试次数
+    allow_quota_limited = bool(attempts) and all(
+        model_quota_is_limited(k.id, virtual) for _, k in attempts
+    )
     for tier, key in attempts:
         if tier_is_rate_limited(tier.id):
             continue  # 同池短路：该层已在本次请求内被标记 TPM 冷却
-        if model_quota_is_limited(key.id, virtual):
+        if model_quota_is_limited(key.id, virtual) and not allow_quota_limited:
             continue  # 模型池冷却：该 key 上本模型的积分池刚报 429
         native = await resolve_native(virtual, tier.provider_id, db)
         base = base_url_for(tier.provider)
@@ -365,10 +382,14 @@ async def route_embeddings(channel: Channel, body: dict, db: AsyncSession) -> JS
         return _no_key_response()
 
     last_error = "无可用上游"
+    # 同 chat：全冷却时豁免跳过，兜底组合才有机会执行
+    allow_quota_limited = bool(attempts) and all(
+        model_quota_is_limited(k.id, virtual) for _, k in attempts
+    )
     for tier, key in attempts:
         if tier_is_rate_limited(tier.id):
             continue  # 同池短路：该层已被标记 TPM 冷却
-        if model_quota_is_limited(key.id, virtual):
+        if model_quota_is_limited(key.id, virtual) and not allow_quota_limited:
             continue  # 模型池冷却：该 key 上本模型的积分池刚报 429
         native = await resolve_native(virtual, tier.provider_id, db)
         base = base_url_for(tier.provider)
