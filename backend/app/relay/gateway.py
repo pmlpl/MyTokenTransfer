@@ -170,6 +170,24 @@ def _no_key_response() -> JSONResponse:
     )
 
 
+def _cooldown_exemptions(
+    attempts: list[tuple[ChannelTier, ApiKey]], virtual: str
+) -> tuple[bool, bool]:
+    """兜底组合的守卫豁免判定，返回 (allow_quota_limited, allow_tier_limited)。
+
+    attempts 全部带着模型池冷却标记时（兜底场景）不跳过，否则兜底白加；
+    存在无冷却组合时仍跳过冷却中的，避免浪费重试次数。tier TPM 冷却同理：
+    最终兜底拿到的组合全部处于整层冷却时豁免守卫。
+    """
+    allow_quota_limited = bool(attempts) and all(
+        model_quota_is_limited(k.id, virtual) for _, k in attempts
+    )
+    allow_tier_limited = bool(attempts) and all(
+        tier_is_rate_limited(t.id) for t, _ in attempts
+    )
+    return allow_quota_limited, allow_tier_limited
+
+
 async def _revive_if_exhausted(key: ApiKey, db: AsyncSession) -> None:
     """最后尝试拿到 200 = 真实流量证明额度窗口已恢复，直接把密钥拉回 active。
 
@@ -193,15 +211,7 @@ async def route_chat_completions(
         return _no_key_response()
 
     last_error = "无可用上游"
-    # attempts 全部带着模型池冷却标记时（兜底场景）不跳过，否则兜底白加；
-    # 存在无冷却组合时仍跳过冷却中的，避免浪费重试次数。tier 冷却同理：
-    # 最终兜底拿到的组合全部处于整层冷却时豁免守卫。
-    allow_quota_limited = bool(attempts) and all(
-        model_quota_is_limited(k.id, virtual) for _, k in attempts
-    )
-    allow_tier_limited = bool(attempts) and all(
-        tier_is_rate_limited(t.id) for t, _ in attempts
-    )
+    allow_quota_limited, allow_tier_limited = _cooldown_exemptions(attempts, virtual)
     for tier, key in attempts:
         if tier_is_rate_limited(tier.id) and not allow_tier_limited:
             continue  # 同池短路：该层已在本次请求内被标记 TPM 冷却
@@ -395,12 +405,7 @@ async def route_embeddings(channel: Channel, body: dict, db: AsyncSession) -> JS
 
     last_error = "无可用上游"
     # 同 chat：全冷却时豁免跳过，兜底组合才有机会执行
-    allow_quota_limited = bool(attempts) and all(
-        model_quota_is_limited(k.id, virtual) for _, k in attempts
-    )
-    allow_tier_limited = bool(attempts) and all(
-        tier_is_rate_limited(t.id) for t, _ in attempts
-    )
+    allow_quota_limited, allow_tier_limited = _cooldown_exemptions(attempts, virtual)
     for tier, key in attempts:
         if tier_is_rate_limited(tier.id) and not allow_tier_limited:
             continue  # 同池短路：该层已被标记 TPM 冷却

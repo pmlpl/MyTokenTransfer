@@ -1,7 +1,8 @@
 """池内密钥选择：gateway.ordered_keys 的单测。
 
-验证故障转移的"自动跳过不可用 key"语义——exhausted/invalid/rate_limited 的 key
-不会被选中，请求自动落到下一个可用账号。这是方案 §3.3 的核心。
+验证故障转移的"自动跳过不可用 key"语义——exhausted/invalid/disabled 的 key
+不会被选中，rate_limited 仅在冷却未到期时跳过（f73ec51 起，冷却到期即视为
+可用，最多省一个巡检周期的容量）。这是方案 §3.3 的核心。
 """
 from __future__ import annotations
 
@@ -11,7 +12,17 @@ from sqlalchemy import select
 
 from app.models import ApiKey, Channel, ChannelKey, ChannelTier, Provider
 from app.models.enums import KeyStrategy, KeyStatus
-from app.relay.balancer import now_utc, ordered_keys, routing_affinity
+from app.relay.balancer import (
+    last_resort_keys,
+    final_resort_keys,
+    mark_model_quota_limited,
+    mark_tier_rate_limited,
+    model_quota_is_limited,
+    now_utc,
+    ordered_keys,
+    routing_affinity,
+    tier_is_rate_limited,
+)
 
 
 async def _make_tier_with_keys(db, channel, provider, *specs: tuple[KeyStatus, int, int | None]):
@@ -57,8 +68,13 @@ async def _provider(db) -> Provider:
     return p
 
 
-async def test_skips_non_active_keys(db_session):
-    """只有 active 的 key 被选中；exhausted/rate_limited/disabled 全部跳过。"""
+async def test_skips_exhausted_and_disabled_keys(db_session):
+    """exhausted/disabled 不被选中；rate_limited 冷却到期（含无期限）视为可用。
+
+    f73ec51 语义：冷却已到期但巡检尚未复测回 active 的 key 直接当可用；
+    只有冷却未到期才跳过（单独用例覆盖）。exhausted 走 last_resort_keys
+    兜底通道，不在正常路径出现。
+    """
     db = db_session
     ch = await _channel(db)
     p = await _provider(db)
@@ -66,13 +82,103 @@ async def test_skips_non_active_keys(db_session):
         db, ch, p,
         (KeyStatus.active, 1, 0),
         (KeyStatus.exhausted, 1, 0),
-        (KeyStatus.rate_limited, 1, 0),
+        (KeyStatus.rate_limited, 1, 0),   # 无 rate_limited_until → 视为冷却已过
         (KeyStatus.disabled, 1, 0),
     )
+    # 已到期的限流冷却同理可用
+    expired = ApiKey(
+        provider_id=p.id, name="k-expired", key_value="dummy-cipher",
+        key_mask="sk-…xxxx", status=KeyStatus.rate_limited, weight=1, tags=None,
+        rate_limited_until=now_utc() - timedelta(minutes=1),
+    )
+    db.add(expired)
+    await db.flush()
+    db.add(ChannelKey(channel_tier_id=tier.id, key_id=expired.id, weight=1, priority=0))
+    await db.commit()
 
     chosen = await ordered_keys(tier, KeyStrategy.round_robin, db)
-    assert len(chosen) == 1
-    assert chosen[0].id == keys[0].id
+    assert [k.id for k in chosen] == [keys[0].id, keys[2].id, expired.id]
+
+
+async def test_last_resort_keys_exhausted_oldest_first(db_session):
+    """last_resort_keys：只取 exhausted，最久未测优先，limit 截断最旧的。"""
+    db = db_session
+    ch = await _channel(db)
+    p = await _provider(db)
+    tier, keys = await _make_tier_with_keys(
+        db, ch, p,
+        (KeyStatus.active, 1, 0),
+        (KeyStatus.exhausted, 1, 0),
+        (KeyStatus.exhausted, 1, 0),
+        (KeyStatus.disabled, 1, 0),
+    )
+    now = now_utc()
+    keys[1].last_tested_at = now - timedelta(hours=2)
+    keys[2].last_tested_at = now - timedelta(minutes=5)
+    keys[3].last_tested_at = now - timedelta(hours=9)  # disabled，不参与兜底
+    await db.commit()
+
+    got = await last_resort_keys(tier, db, 3)
+    assert [k.id for k in got] == [keys[1].id, keys[2].id]
+    assert [k.id for k in await last_resort_keys(tier, db, 1)] == [keys[1].id]
+
+
+async def test_last_resort_keys_never_tested_first(db_session):
+    """last_tested_at 为 None（从未测过）按最旧处理，排在最前。"""
+    db = db_session
+    ch = await _channel(db)
+    p = await _provider(db)
+    tier, keys = await _make_tier_with_keys(
+        db, ch, p,
+        (KeyStatus.exhausted, 1, 0),  # 从未测过 → None
+        (KeyStatus.exhausted, 1, 0),
+    )
+    keys[1].last_tested_at = now_utc()
+    await db.commit()
+
+    got = await last_resort_keys(tier, db, 2)
+    assert [k.id for k in got] == [keys[0].id, keys[1].id]
+
+
+async def test_final_resort_keys_all_but_invalid(db_session):
+    """final_resort_keys：仅排除 invalid，其余状态全取，最久未测优先。
+
+    tier TPM 冷却的最终兜底无视冷却标记，所以 rate_limited/disabled 也参与。
+    """
+    db = db_session
+    ch = await _channel(db)
+    p = await _provider(db)
+    tier, keys = await _make_tier_with_keys(
+        db, ch, p,
+        (KeyStatus.active, 1, 0),
+        (KeyStatus.exhausted, 1, 0),        # 从未测过 → None，排最前
+        (KeyStatus.rate_limited, 1, 0),
+        (KeyStatus.invalid, 1, 0),
+        (KeyStatus.disabled, 1, 0),
+    )
+    now = now_utc()
+    keys[0].last_tested_at = now - timedelta(hours=1)
+    keys[2].last_tested_at = now - timedelta(minutes=30)
+    keys[4].last_tested_at = now - timedelta(hours=2)
+    await db.commit()
+
+    got = await final_resort_keys(tier, db, 10)
+    assert [k.id for k in got] == [keys[1].id, keys[4].id, keys[0].id, keys[2].id]
+
+
+def test_model_quota_cooldown_is_per_model_pool():
+    """(key, 模型) 组合冷却：同 key 其他模型、同模型其他 key 均不受影响。"""
+    mark_model_quota_limited(11, "deepseek-v4-flash")
+    assert model_quota_is_limited(11, "deepseek-v4-flash")
+    assert not model_quota_is_limited(11, "glm-5.2")       # 同 key 换模型不受牵连
+    assert not model_quota_is_limited(12, "deepseek-v4-flash")  # 同模型换 key 不受牵连
+
+
+def test_tier_rate_limited_scopes_to_tier():
+    """tier TPM 冷却只影响被标记的层。"""
+    mark_tier_rate_limited(3)
+    assert tier_is_rate_limited(3)
+    assert not tier_is_rate_limited(4)
 
 
 async def test_rate_limited_future_cooldown_skipped(db_session):
