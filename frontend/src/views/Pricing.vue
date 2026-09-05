@@ -65,7 +65,7 @@
           <n-input-number v-model:value="form.off_peak_output_price" :min="0" :step="0.1" :precision="6" style="width: 100%" placeholder="0=沿用标准价" />
         </n-form-item>
         <n-form-item label=" ">
-          <span style="font-size: 12px; color: var(--n-text-color-3, #999)">空闲时段为北京时间 00:30–08:30，折扣价仅该时段生效；无分时定价的模型保持 0 即可</span>
+          <span style="font-size: 12px; color: var(--n-text-color-3, #999)">高峰时段为周一至周五 9:00–12:00、14:00–18:00（北京时间），其余时间按空闲价计费；无分时定价的模型保持 0 即可</span>
         </n-form-item>
         <n-form-item label="币种">
           <n-select v-model:value="form.currency" :options="currencyOptions" />

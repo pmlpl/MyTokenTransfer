@@ -11,20 +11,24 @@ from sqlalchemy import select
 from app.database import AsyncSessionLocal
 from app.models import CallLog, ModelPricing
 
-# 空闲时段（北京时间 00:30–08:30，含头不含尾）：DeepSeek 官方按此时段给折扣价。
-# 价表里空闲价填 0 表示该模型无分时定价，全天按标准价计费。
-_OFF_PEAK_START = time(0, 30)
-_OFF_PEAK_END = time(8, 30)
+# 峰谷时段（DeepSeek 官方定义）：北京时间周一至周五 9:00–12:00、14:00–18:00 为
+# 高峰，其余时间（夜间、周末）为空闲，空闲价约为高峰一半。
+# 价表 input_price/output_price 存高峰价，off_peak_* 存空闲价；
+# 空闲价填 0 表示该模型无分时定价，全天按标准（高峰）价计费。
+_PEAK_WINDOWS = ((time(9, 0), time(12, 0)), (time(14, 0), time(18, 0)))
 
 
 def _now() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
-def _in_off_peak(now_utc: datetime) -> bool:
-    """UTC 时间换算北京时间后判断是否落在空闲时段（窗口跨午夜，直接比较 time）。"""
+def _in_peak(now_utc: datetime) -> bool:
+    """UTC 换算北京时间后判断是否处于高峰时段（周一至周五 9–12 / 14–18 点）。"""
     bj = now_utc + timedelta(hours=8)
-    return _OFF_PEAK_START <= bj.time() < _OFF_PEAK_END
+    if bj.weekday() >= 5:  # 5=周六 6=周日，周末全天空闲
+        return False
+    t = bj.time()
+    return any(start <= t < end for start, end in _PEAK_WINDOWS)
 
 
 async def write_call_log(
@@ -61,13 +65,13 @@ async def write_call_log(
             )
             if p is not None:
                 uncached = max(0, pt - cached)
-                # 空闲时段用折扣价；某档空闲价未填（0）则沿用标准价
-                if _in_off_peak(_now()):
-                    in_price = float(p.off_peak_input_price) or float(p.input_price)
-                    out_price = float(p.off_peak_output_price) or float(p.output_price)
-                else:
+                # 高峰档用标准价，空闲档用折扣价；某档空闲价未填（0）则沿用高峰价
+                if _in_peak(_now()):
                     in_price = float(p.input_price)
                     out_price = float(p.output_price)
+                else:
+                    in_price = float(p.off_peak_input_price) or float(p.input_price)
+                    out_price = float(p.off_peak_output_price) or float(p.output_price)
                 cost = round(
                     cached * float(p.cached_input_price) / 1_000_000
                     + uncached * in_price / 1_000_000
