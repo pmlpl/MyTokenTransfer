@@ -16,8 +16,10 @@ scheduler = AsyncIOScheduler()
 
 # 巡检间隔（分钟）
 SWEEP_INTERVAL_MINUTES = 10
-# exhausted 状态密钥的最小重测间隔（分钟），避免频繁命中 429 quota
-EXHAUSTED_RETEST_MINUTES = 60
+# exhausted 状态密钥的最小重测间隔（分钟）。
+# 转售商额度窗口（按 key 配额）滚动恢复常在几十分钟内，60 分钟锁空窗期太长；
+# 1-token 探针成本极低，10 分钟复测让恢复的密钥尽快回池参与调度。
+EXHAUSTED_RETEST_MINUTES = 10
 
 
 async def sweep_degraded_keys() -> None:

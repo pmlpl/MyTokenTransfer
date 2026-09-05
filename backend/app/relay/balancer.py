@@ -27,6 +27,23 @@ _AFFINITY_PREFIX_BUDGET = 4096
 # 限流冷却时长（秒）：命中 429 时把 key 标 rate_limited 并冷却这段时间
 _RATE_LIMIT_COOLDOWN = 60
 
+# Tier 级速率限制冷却：同一 provider 的密钥共享上游 TPM 池，一个限流全限流。
+# 标记整层冷却后，单次请求内跳过同层剩余密钥（避免无效重试），
+# 冷却期内新请求也不再碰这层（避免持续打爆已限流的池）。
+_tier_rate_limited_until: dict[int, datetime] = {}
+
+
+def mark_tier_rate_limited(tier_id: int, cooldown: int = _RATE_LIMIT_COOLDOWN) -> None:
+    """标记整个 tier 处于速率限制冷却期（同池密钥共享 TPM，一个限流全限流）。"""
+    _tier_rate_limited_until[tier_id] = now_utc() + timedelta(seconds=cooldown)
+    log.warning("tier_rate_limited", tier_id=tier_id, cooldown_sec=cooldown)
+
+
+def tier_is_rate_limited(tier_id: int) -> bool:
+    """检查 tier 是否处于速率限制冷却期。"""
+    until = _tier_rate_limited_until.get(tier_id)
+    return until is not None and until > now_utc()
+
 
 def now_utc() -> datetime:
     """当前 UTC 时间（naive，与 DB 时间口径一致）。"""
@@ -123,9 +140,11 @@ async def ordered_keys(
         ak = await db.get(ApiKey, ck.key_id)
         if not ak:
             continue
-        if ak.status != KeyStatus.active:
-            continue
-        if ak.rate_limited_until and ak.rate_limited_until > now_utc():
+        if ak.status == KeyStatus.rate_limited:
+            # 冷却已到期但巡检尚未复测回 active：直接当可用，最多省一个巡检周期的容量
+            if ak.rate_limited_until and ak.rate_limited_until > now_utc():
+                continue
+        elif ak.status != KeyStatus.active:
             continue
         pairs.append((ck, ak))
 
@@ -159,6 +178,27 @@ async def ordered_keys(
             idx = affinity % len(pairs)
             pairs = pairs[idx:] + pairs[:idx]
     return [p[1] for p in pairs]
+
+
+async def last_resort_keys(
+    tier: ChannelTier,
+    db: AsyncSession,
+    limit: int,
+) -> list[ApiKey]:
+    """全池耗尽时的最后尝试候选：该层 exhausted 密钥按最久未测优先。
+
+    转售商按 key 的额度窗口滚动恢复常在几分钟到几十分钟内，与其让请求
+    直接 503，不如拿最久未测的 exhausted 密钥赌一把窗口已重置；
+    失败代价只是一次快速 429，成功则直接续上生产流量。
+    """
+    rows = await db.execute(select(ChannelKey).where(ChannelKey.channel_tier_id == tier.id))
+    keys: list[ApiKey] = []
+    for ck in rows.scalars():
+        ak = await db.get(ApiKey, ck.key_id)
+        if ak and ak.status == KeyStatus.exhausted:
+            keys.append(ak)
+    keys.sort(key=lambda k: (k.last_tested_at or datetime.min, k.id))
+    return keys[: max(1, limit)]
 
 
 async def mark_key(

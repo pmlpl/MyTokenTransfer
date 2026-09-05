@@ -20,10 +20,13 @@ from app.models import ApiKey, Channel, ChannelTier, KeyStatus
 from app.relay.accounting import write_call_log
 from app.relay.balancer import (
     base_url_for,
+    last_resort_keys,
     mark_key,
+    mark_tier_rate_limited,
     ordered_keys,
     resolve_native,
     routing_affinity,
+    tier_is_rate_limited,
 )
 from app.relay.errors import classify_error
 from app.services.health_check import _join
@@ -31,11 +34,38 @@ from app.services.health_check import _join
 log = structlog.get_logger("relay")
 
 
+def _normalize_thinking(payload: dict) -> None:
+    """修正 thinking 与 reasoning_effort 的组合，避免上游 400 invalid thinking type。
+
+    智谱 API 约束：reasoning_effort=none 时 thinking 必须 disabled；
+    reasoning_effort≠none 时 thinking 必须 enabled。部分客户端（如 zcode）
+    会发矛盾组合，这里自动对齐。
+    """
+    thinking = payload.get("thinking")
+    if thinking is None:
+        return
+    effort = payload.get("reasoning_effort")
+    effort_is_none = effort is None or str(effort).lower() in ("none", "disabled", "")
+    # 归一化 thinking 值：字符串/布尔都接受
+    if isinstance(thinking, bool):
+        thinking_val = "enabled" if thinking else "disabled"
+    else:
+        thinking_val = str(thinking).lower()
+    if effort_is_none:
+        if thinking_val != "disabled":
+            payload["thinking"] = "disabled"
+    else:
+        if thinking_val != "enabled":
+            payload["thinking"] = "enabled"
+
+
 def _build_payload(body: dict, native_model: str, stream: bool) -> dict:
     """构造发给上游的请求体：透传 OpenAI 参数，覆盖 model/stream。"""
     payload = dict(body)
     payload["model"] = native_model
     payload["stream"] = stream
+    # 修正 thinking/reasoning_effort 组合（zcode 等客户端易发矛盾参数）
+    _normalize_thinking(payload)
     # 流式时尽量带上 usage 统计
     if stream and "stream_options" not in payload:
         payload["stream_options"] = {"include_usage": True}
@@ -46,20 +76,64 @@ def _headers(raw_key: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {raw_key}", "Content-Type": "application/json"}
 
 
+# 网络层瞬时故障重试：上游域名偶发 TLS 握手被掐/连接重置（SNI 阻断、NAT 抖动），
+# 同池所有 key 指向同一上游域名，换 key 重试没有意义，原地重试才有用。
+# 仅重试连接/发送阶段的异常（流未打开、请求未发出），HTTP 状态码一律交给 classify_error。
+_NETWORK_RETRY = 3
+_NETWORK_BACKOFF = 1.0  # 秒
+
+
+async def _send_with_retry(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    headers: dict[str, str],
+    json: dict,
+    stream: bool = False,
+):
+    for attempt in range(_NETWORK_RETRY):
+        try:
+            if stream:
+                req = client.build_request("POST", url, headers=headers, json=json)
+                return await client.send(req, stream=True)
+            return await client.post(url, headers=headers, json=json)
+        except Exception as e:
+            if attempt == _NETWORK_RETRY - 1:
+                raise
+            log.warning("network_retry", url=url, attempt=attempt + 1,
+                        error=f"{type(e).__name__}: {e}")
+            await asyncio.sleep(_NETWORK_BACKOFF)
+
+
 async def _build_attempts(
     channel: Channel, db: AsyncSession, affinity: int = 0
 ) -> list[tuple[ChannelTier, ApiKey]]:
     """按 Tier 升序，每层取策略排序后的可用 key（受 max_retries 限）。
 
     affinity 为内容哈希：同一会话固定同一 key，最大化上游前缀缓存命中。
+    全部 key 处于 exhausted 时，尾部追加最久未测的 exhausted 密钥做最后
+    尝试（额度窗口可能已重置），避免直接 503。
     """
     max_retries = max(1, channel.max_retries)
     tiers = sorted(channel.tiers, key=lambda t: t.order)
     attempts: list[tuple[ChannelTier, ApiKey]] = []
     for tier in tiers:
+        if tier_is_rate_limited(tier.id):
+            continue  # 同池短路：整层处于 TPM 冷却，跳过
         keys = await ordered_keys(tier, channel.strategy, db, affinity)
         for k in keys[:max_retries]:
             attempts.append((tier, k))
+    # 全池耗尽兜底：active 尝试之后再追加最久未测的 exhausted 密钥。
+    # 额度窗口可能已滚动重置，试一次的代价是快速 429，收益是少一次 503；
+    # 仅在前面的尝试可重试失败后才会轮到，正常路径零影响。
+    for tier in tiers:
+        if tier_is_rate_limited(tier.id):
+            continue
+        for k in await last_resort_keys(tier, db, max_retries):
+            attempts.append((tier, k))
+    if attempts and all(k.status != KeyStatus.active for _, k in attempts):
+        log.warning("no_active_key_last_resort", channel_id=channel.id,
+                    virtual_model=channel.virtual_model, exhausted_attempts=len(attempts))
     return attempts
 
 
@@ -68,6 +142,15 @@ def _no_key_response() -> JSONResponse:
         status_code=503,
         content={"error": {"message": "无可用密钥（全部失效/限流）", "type": "no_available_key"}},
     )
+
+
+async def _revive_if_exhausted(key: ApiKey, db: AsyncSession) -> None:
+    """最后尝试拿到 200 = 真实流量证明额度窗口已恢复，直接把密钥拉回 active。
+
+    比探针复测（最长等 10 分钟巡检）更快回池；告警随 mark_key 自动 resolve。
+    """
+    if key.status == KeyStatus.exhausted:
+        await mark_key(key, KeyStatus.active, db, message="真实请求成功，自动恢复")
 
 
 async def route_chat_completions(
@@ -85,6 +168,8 @@ async def route_chat_completions(
 
     last_error = "无可用上游"
     for tier, key in attempts:
+        if tier_is_rate_limited(tier.id):
+            continue  # 同池短路：该层已在本次请求内被标记 TPM 冷却
         native = await resolve_native(virtual, tier.provider_id, db)
         base = base_url_for(tier.provider)
         if not base:
@@ -103,8 +188,9 @@ async def route_chat_completions(
         if stream:
             client = httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=10.0))
             try:
-                req = client.build_request("POST", url, headers=_headers(raw), json=payload)
-                response = await client.send(req, stream=True)
+                response = await _send_with_retry(
+                    client, url, headers=_headers(raw), json=payload, stream=True
+                )
             except Exception as e:
                 await client.aclose()
                 last_error = f"{type(e).__name__}: {e}"
@@ -115,6 +201,8 @@ async def route_chat_completions(
                 await response.aclose()
                 await client.aclose()
                 retry, mark, msg = classify_error(response.status_code, err_text)
+                if mark == KeyStatus.rate_limited:
+                    mark_tier_rate_limited(tier.id)  # 同池短路：整层 TPM 冷却
                 await mark_key(key, mark, db, message=msg)
                 last_error = msg
                 if retry:
@@ -124,6 +212,7 @@ async def route_chat_completions(
                     content={"error": {"message": msg, "type": "upstream_error"}},
                 )
             # 200：流已打开，故障转移窗口关闭
+            await _revive_if_exhausted(key, db)
             meta = {
                 "channel_id": channel.id,
                 "tier_order": tier.order,
@@ -139,13 +228,14 @@ async def route_chat_completions(
         else:
             try:
                 async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=10.0)) as client:
-                    resp = await client.post(url, headers=_headers(raw), json=payload)
+                    resp = await _send_with_retry(client, url, headers=_headers(raw), json=payload)
             except Exception as e:
                 last_error = f"{type(e).__name__}: {e}"
                 continue
             latency_ms = int((time.time() - t0) * 1000)
             if resp.status_code == 200:
                 data = resp.json()
+                await _revive_if_exhausted(key, db)
                 await write_call_log(
                     channel_id=channel.id,
                     tier_order=tier.order,
@@ -161,6 +251,8 @@ async def route_chat_completions(
                 )
                 return JSONResponse(status_code=200, content=data)
             retry, mark, msg = classify_error(resp.status_code, resp.text)
+            if mark == KeyStatus.rate_limited:
+                mark_tier_rate_limited(tier.id)  # 同池短路：整层 TPM 冷却
             await mark_key(key, mark, db, message=msg)
             await write_call_log(
                 channel_id=channel.id,
@@ -258,6 +350,8 @@ async def route_embeddings(channel: Channel, body: dict, db: AsyncSession) -> JS
 
     last_error = "无可用上游"
     for tier, key in attempts:
+        if tier_is_rate_limited(tier.id):
+            continue  # 同池短路：该层已被标记 TPM 冷却
         native = await resolve_native(virtual, tier.provider_id, db)
         base = base_url_for(tier.provider)
         if not base:
@@ -276,13 +370,14 @@ async def route_embeddings(channel: Channel, body: dict, db: AsyncSession) -> JS
         t0 = time.time()
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=10.0)) as client:
-                resp = await client.post(url, headers=_headers(raw), json=payload)
+                resp = await _send_with_retry(client, url, headers=_headers(raw), json=payload)
         except Exception as e:
             last_error = f"{type(e).__name__}: {e}"
             continue
         latency_ms = int((time.time() - t0) * 1000)
         if resp.status_code == 200:
             data = resp.json()
+            await _revive_if_exhausted(key, db)
             await write_call_log(
                 channel_id=channel.id,
                 tier_order=tier.order,
@@ -298,6 +393,8 @@ async def route_embeddings(channel: Channel, body: dict, db: AsyncSession) -> JS
             )
             return JSONResponse(status_code=200, content=data)
         retry, mark, msg = classify_error(resp.status_code, resp.text)
+        if mark == KeyStatus.rate_limited:
+            mark_tier_rate_limited(tier.id)  # 同池短路：整层 TPM 冷却
         await mark_key(key, mark, db, message=msg)
         await write_call_log(
             channel_id=channel.id,
