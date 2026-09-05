@@ -22,13 +22,15 @@ from app.relay.balancer import (
     base_url_for,
     last_resort_keys,
     mark_key,
+    mark_model_quota_limited,
     mark_tier_rate_limited,
+    model_quota_is_limited,
     ordered_keys,
     resolve_native,
     routing_affinity,
     tier_is_rate_limited,
 )
-from app.relay.errors import classify_error
+from app.relay.errors import classify_error, is_model_pool_quota
 from app.services.health_check import _join
 
 log = structlog.get_logger("relay")
@@ -116,12 +118,16 @@ async def _build_attempts(
     """
     max_retries = max(1, channel.max_retries)
     tiers = sorted(channel.tiers, key=lambda t: t.order)
+    virtual = channel.virtual_model
     attempts: list[tuple[ChannelTier, ApiKey]] = []
     for tier in tiers:
         if tier_is_rate_limited(tier.id):
             continue  # 同池短路：整层处于 TPM 冷却，跳过
         keys = await ordered_keys(tier, channel.strategy, db, affinity)
+        # 模型池冷却：该 key 上本模型的积分池刚报 429，跳过（其他模型不受影响）
         for k in keys[:max_retries]:
+            if model_quota_is_limited(k.id, virtual):
+                continue
             attempts.append((tier, k))
     # 全池耗尽兜底：active 尝试之后再追加最久未测的 exhausted 密钥。
     # 额度窗口可能已滚动重置，试一次的代价是快速 429，收益是少一次 503；
@@ -170,6 +176,8 @@ async def route_chat_completions(
     for tier, key in attempts:
         if tier_is_rate_limited(tier.id):
             continue  # 同池短路：该层已在本次请求内被标记 TPM 冷却
+        if model_quota_is_limited(key.id, virtual):
+            continue  # 模型池冷却：该 key 上本模型的积分池刚报 429
         native = await resolve_native(virtual, tier.provider_id, db)
         base = base_url_for(tier.provider)
         if not base:
@@ -203,7 +211,11 @@ async def route_chat_completions(
                 retry, mark, msg = classify_error(response.status_code, err_text)
                 if mark == KeyStatus.rate_limited:
                     mark_tier_rate_limited(tier.id)  # 同池短路：整层 TPM 冷却
-                await mark_key(key, mark, db, message=msg)
+                elif mark == KeyStatus.exhausted and is_model_pool_quota(err_text):
+                    # 模型池级额度耗尽：只冷却 (key, 模型) 组合，不把整把 key 标死
+                    mark_model_quota_limited(key.id, virtual)
+                else:
+                    await mark_key(key, mark, db, message=msg)
                 last_error = msg
                 if retry:
                     continue
@@ -253,7 +265,11 @@ async def route_chat_completions(
             retry, mark, msg = classify_error(resp.status_code, resp.text)
             if mark == KeyStatus.rate_limited:
                 mark_tier_rate_limited(tier.id)  # 同池短路：整层 TPM 冷却
-            await mark_key(key, mark, db, message=msg)
+            elif mark == KeyStatus.exhausted and is_model_pool_quota(resp.text):
+                # 模型池级额度耗尽：只冷却 (key, 模型) 组合，不把整把 key 标死
+                mark_model_quota_limited(key.id, virtual)
+            else:
+                await mark_key(key, mark, db, message=msg)
             await write_call_log(
                 channel_id=channel.id,
                 tier_order=tier.order,
@@ -352,6 +368,8 @@ async def route_embeddings(channel: Channel, body: dict, db: AsyncSession) -> JS
     for tier, key in attempts:
         if tier_is_rate_limited(tier.id):
             continue  # 同池短路：该层已被标记 TPM 冷却
+        if model_quota_is_limited(key.id, virtual):
+            continue  # 模型池冷却：该 key 上本模型的积分池刚报 429
         native = await resolve_native(virtual, tier.provider_id, db)
         base = base_url_for(tier.provider)
         if not base:
@@ -395,7 +413,11 @@ async def route_embeddings(channel: Channel, body: dict, db: AsyncSession) -> JS
         retry, mark, msg = classify_error(resp.status_code, resp.text)
         if mark == KeyStatus.rate_limited:
             mark_tier_rate_limited(tier.id)  # 同池短路：整层 TPM 冷却
-        await mark_key(key, mark, db, message=msg)
+        elif mark == KeyStatus.exhausted and is_model_pool_quota(resp.text):
+            # 模型池级额度耗尽：只冷却 (key, 模型) 组合，不把整把 key 标死
+            mark_model_quota_limited(key.id, virtual)
+        else:
+            await mark_key(key, mark, db, message=msg)
         await write_call_log(
             channel_id=channel.id,
             tier_order=tier.order,

@@ -45,6 +45,28 @@ def tier_is_rate_limited(tier_id: int) -> bool:
     return until is not None and until > now_utc()
 
 
+# 模型池级额度冷却：转售商按 key×模型 划分积分池，某模型的池子用尽（429
+# "Allocated quota exceeded"）与密钥本身无关——同一把 key 上其他模型仍可用。
+# 只对 (key, virtual_model) 组合短冷却，不把整把 key 标 exhausted，
+# 否则 deepseek 的池子干涸会把 glm-5.2 还能用的 key 全部踢出调度。
+_model_quota_limited_until: dict[tuple[int, str], datetime] = {}
+_MODEL_QUOTA_COOLDOWN = 300
+
+
+def mark_model_quota_limited(key_id: int, virtual_model: str,
+                             cooldown: int = _MODEL_QUOTA_COOLDOWN) -> None:
+    """冷却 (key, 模型) 组合：该 key 上该模型的积分池暂时用尽。"""
+    _model_quota_limited_until[(key_id, virtual_model)] = now_utc() + timedelta(seconds=cooldown)
+    log.warning("model_quota_limited", key_id=key_id, virtual_model=virtual_model,
+                cooldown_sec=cooldown)
+
+
+def model_quota_is_limited(key_id: int, virtual_model: str) -> bool:
+    """检查该 key 上该模型是否处于模型池额度冷却期。"""
+    until = _model_quota_limited_until.get((key_id, virtual_model))
+    return until is not None and until > now_utc()
+
+
 def now_utc() -> datetime:
     """当前 UTC 时间（naive，与 DB 时间口径一致）。"""
     return datetime.now(timezone.utc).replace(tzinfo=None)

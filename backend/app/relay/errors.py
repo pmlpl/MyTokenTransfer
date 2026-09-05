@@ -33,6 +33,17 @@ _RATE_LIMIT_KEYWORDS = (
 # 注意：不包含单独的 "exhausted"，因为 "tpm exhausted" 是速率限制而非额度耗尽
 _QUOTA_KEYWORDS = ("quota", "entitlement", "余额", "insufficient", "exceeded")
 
+# 模型池级额度耗尽特征：转售商按 key×模型 划分积分池（实测同一把 key 上
+# deepseek 429 而 glm-5.2 同秒成功），某模型的池子用尽返回该文案。
+# 此时密钥本身（鉴权、其他模型的池）仍健康，不应标 exhausted 污染全局状态。
+_MODEL_POOL_QUOTA_MARKERS = ("allocated quota exceeded",)
+
+
+def is_model_pool_quota(body_text: str) -> bool:
+    """判断 429 正文是否为「模型池级」额度耗尽（而非密钥级余额用尽）。"""
+    text = (body_text or "").lower()
+    return any(m in text for m in _MODEL_POOL_QUOTA_MARKERS)
+
 
 def classify_error(status_code: int, body_text: str) -> tuple[bool, KeyStatus | None, str]:
     """返回 (是否可重试/切换, 标记的状态, 错误描述)。
