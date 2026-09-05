@@ -56,6 +56,13 @@
           <n-tab-pane name="model" tab="按模型" />
         </n-tabs>
       </template>
+      <div v-if="metric === 'model'" class="model-metric-switch">
+        <n-tabs v-model:value="modelMetric" type="segment" size="small">
+          <n-tab-pane name="tokens" tab="总 Tokens" />
+          <n-tab-pane name="calls" tab="请求数" />
+          <n-tab-pane name="cost" tab="成本" />
+        </n-tabs>
+      </div>
       <v-chart v-if="trendOpt" :option="trendOpt" autoresize style="height: 360px" />
       <EmptyState v-else title="无数据" description="该时间范围内无调用记录" />
     </DataCard>
@@ -118,6 +125,21 @@ const data = ref<UsageResp | null>(null)
 const days = ref(1)
 const currency = ref('CNY')
 const metric = ref<'tokens' | 'calls' | 'cost' | 'cache' | 'model'>('tokens')
+// 按模型视图的指标切换（趋势分析 → 按模型 Tab 内）
+const modelMetric = ref<'tokens' | 'calls' | 'cost'>('tokens')
+const MODEL_METRIC_META = {
+  tokens: { unit: 'tokens', axis: '总 Tokens' },
+  calls: { unit: '次', axis: '调用次数' },
+  cost: { unit: '元', axis: '成本（元）' },
+} as const
+const ZERO_ROW = { calls: 0, total_tokens: 0, cost: 0 }
+
+// 按模型视图：从聚合行取当前指标值
+function modelValue(row: { calls: number; total_tokens: number; cost: number }): number {
+  if (modelMetric.value === 'calls') return Number(row.calls ?? 0)
+  if (modelMetric.value === 'cost') return Number(row.cost ?? 0)
+  return Number(row.total_tokens ?? 0)
+}
 
 const totals = computed(() => data.value?.totals ?? { calls: 0, total_tokens: 0, cached_tokens: 0, cache_hit_rate: 0, cost: 0 })
 
@@ -310,24 +332,27 @@ function buildTodayWave(): any | null {
     const modelSet = new Set<string>()
     for (const r of rows) modelSet.add(r.model)
     const models = Array.from(modelSet)
-    const matrix: Record<string, Record<string, number>> = {}
+    // matrix[小时][模型] = 聚合行，指标切换时按 modelMetric 取值
+    const matrix: Record<string, Record<string, { calls: number; total_tokens: number; cost: number }>> = {}
     for (const hr of hourKeys) matrix[hr] = {}
     for (const r of rows) {
       const hrLabel = `${String(r.hour).padStart(2, '0')}:00`
       if (hourKeys.includes(hrLabel)) {
-        matrix[hrLabel]![r.model] = Number(r.total_tokens ?? 0)
+        matrix[hrLabel]![r.model] = { calls: Number(r.calls ?? 0), total_tokens: Number(r.total_tokens ?? 0), cost: Number(r.cost ?? 0) }
       }
     }
+    const meta = MODEL_METRIC_META[modelMetric.value]
+    const fmt = modelMetric.value === 'cost' ? (v: number) => v.toFixed(4) : undefined
     return {
-      tooltip: { trigger: 'axis', formatter: (p: any[]) => lineTooltip(p, 'tokens') },
+      tooltip: { trigger: 'axis', formatter: (p: any[]) => lineTooltip(p, meta.unit, fmt) },
       legend: { data: models, top: 0, type: 'scroll' },
       grid: { left: 56, right: 24, top: 40, bottom: 32 },
       xAxis: baseXAxis,
-      yAxis: { type: 'value', name: '总 Tokens', axisLabel: { formatter: (v: number) => fmtAxis(v) } },
+      yAxis: { type: 'value', name: meta.axis, axisLabel: { formatter: (v: number) => fmtAxis(v) } },
       series: models.map((m, idx) => ({
         name: m, type: 'line', smooth: true, symbol: 'circle', symbolSize: 5,
         emphasis: { focus: 'series' },
-        data: hourKeys.map((hr) => matrix[hr]?.[m] ?? 0),
+        data: hourKeys.map((hr) => modelValue(matrix[hr]?.[m] ?? ZERO_ROW)),
         lineStyle: { width: 2.5, color: modelColor(m, idx) },
         itemStyle: { color: modelColor(m, idx) },
       })),
@@ -441,19 +466,25 @@ function buildMultiDayBar(): any | null {
     for (const r of rows) { dateSet.add(r.date); modelSet.add(r.model) }
     const datesArr = Array.from(dateSet).sort()
     const models = Array.from(modelSet)
-    const matrix: Record<string, Record<string, number>> = {}
+    const matrix: Record<string, Record<string, { calls: number; total_tokens: number; cost: number }>> = {}
     for (const d of datesArr) matrix[d] = {}
-    for (const r of rows) matrix[r.date]![r.model] = Number(r.total_tokens ?? 0)
+    for (const r of rows) matrix[r.date]![r.model] = { calls: Number(r.calls ?? 0), total_tokens: Number(r.total_tokens ?? 0), cost: Number(r.cost ?? 0) }
+    const meta = MODEL_METRIC_META[modelMetric.value]
     return {
-      tooltip: { trigger: 'axis', axisPointer: { type: 'cross' }, valueFormatter: (v: number) => `${Number(v).toLocaleString()} tokens` },
+      tooltip: {
+        trigger: 'axis', axisPointer: { type: 'cross' },
+        valueFormatter: (v: number) => modelMetric.value === 'cost'
+          ? `${Number(v).toLocaleString(undefined, { maximumFractionDigits: 4 })} ${meta.unit}`
+          : `${Number(v).toLocaleString()} ${meta.unit}`,
+      },
       legend: { data: models, top: 0 },
       grid: { left: 56, right: 24, top: 40, bottom: 32 },
       xAxis: { type: 'category', boundaryGap: true, data: datesArr },
-      yAxis: { type: 'value', name: '总 Tokens', axisLabel: { formatter: (v: number) => fmtAxis(v) } },
+      yAxis: { type: 'value', name: meta.axis, axisLabel: { formatter: (v: number) => fmtAxis(v) } },
       series: models.map((m, idx) => ({
-        name: m, type: 'bar', stack: 'tokens', barMaxWidth: 36, emphasis: { focus: 'series' },
+        name: m, type: 'bar', stack: `model-${modelMetric.value}`, barMaxWidth: 36, emphasis: { focus: 'series' },
         itemStyle: { color: modelColor(m, idx) },
-        data: datesArr.map((d) => matrix[d]?.[m] ?? 0),
+        data: datesArr.map((d) => modelValue(matrix[d]?.[m] ?? ZERO_ROW)),
       })),
     }
   }
@@ -516,6 +547,9 @@ onMounted(load)
   display: flex;
   flex-direction: column;
   gap: 16px;
+}
+.model-metric-switch {
+  margin-bottom: 8px;
 }
 .kpi-grid {
   display: grid;

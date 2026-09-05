@@ -80,6 +80,7 @@ async def usage(
         select(
             DailyUsage.day.label("d"),
             DailyUsage.model.label("m"),
+            func.sum(DailyUsage.calls).label("calls"),
             func.sum(DailyUsage.total_tokens).label("tt"),
             func.sum(DailyUsage.cost).label("cost"),
         )
@@ -92,6 +93,7 @@ async def usage(
         {
             "date": str(r.d),
             "model": str(r.m or "未知"),
+            "calls": int(r.calls or 0),
             "total_tokens": int(r.tt or 0),
             "cost": float(r.cost or 0),
         }
@@ -217,6 +219,7 @@ async def usage(
             select(
                 hour_expr.label("hr"),
                 model_field.label("m"),
+                func.count(CallLog.id).label("calls"),
                 func.sum(CallLog.total_tokens).label("tt"),
                 func.sum(CallLog.cost).label("cost"),
             )
@@ -229,6 +232,7 @@ async def usage(
             {
                 "hour": int(r.hr),
                 "model": str(r.m or "未知"),
+                "calls": int(r.calls or 0),
                 "total_tokens": int(r.tt or 0),
                 "cost": float(r.cost or 0),
             }
