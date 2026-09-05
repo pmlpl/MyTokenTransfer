@@ -114,8 +114,8 @@ export interface Pricing {
 
 export interface UsageResp {
   days: number
-  hourly: { hour: number; calls: number; prompt_tokens: number; completion_tokens: number; total_tokens: number; cached_tokens: number; cost: number }[]
-  hourly_by_model: { hour: number; model: string; calls: number; total_tokens: number; cost: number }[]
+  hourly: { hour: number; label: string; is_today: boolean; calls: number; prompt_tokens: number; completion_tokens: number; total_tokens: number; cached_tokens: number; cost: number }[]
+  hourly_by_model: { hour: number; label: string; is_today: boolean; model: string; calls: number; total_tokens: number; cost: number }[]
   daily: { date: string; calls: number; prompt_tokens: number; completion_tokens: number; total_tokens: number; cached_tokens: number; cost: number }[]
   daily_by_model: { date: string; model: string; calls: number; total_tokens: number; cost: number }[]
   by_model: { model: string; calls: number; total_tokens: number; cost: number }[]

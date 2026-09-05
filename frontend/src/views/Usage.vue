@@ -157,7 +157,9 @@ function modelColor(model: string, index: number): string {
 // KPI 进度条：当前值占理论最大值（峰值时段 × 总时段数）的比例
 const kpiProgress = computed(() => {
   const isToday = days.value === 1
-  const rows = isToday ? (data.value?.hourly ?? []) : (data.value?.daily ?? [])
+  const allRows = isToday ? (data.value?.hourly ?? []) : (data.value?.daily ?? [])
+  // 波形已改为滚动 24 小时窗口，今日口径的分母只统计属于今天的桶
+  const rows = isToday ? allRows.filter((r: any) => r.is_today !== false) : allRows
   if (!rows.length) return { calls: 0, tokens: 0, cost: 0 }
 
   const totalSlots = isToday ? 24 : days.value
@@ -242,19 +244,18 @@ const trendOpt = computed(() => {
   return buildMultiDayBar()
 })
 
-// 今日波形图（折线 + 平滑 + 面积填充）
+// 近 24 小时波形图（折线 + 平滑 + 面积填充）
 function buildTodayWave(): any | null {
   const allHourly = data.value?.hourly ?? []
   if (!allHourly.length) return null
 
-  // 只保留当前时间及之前的小时，未来小时不显示
+  // 后端给的是滚动近 24 小时窗口（含昨晚，label 带"昨"前缀），整段直接画，
+  // 不再裁剪未来小时——跨午夜时昨晚的 21/22/23 点能和今天连成一条线
   const now = new Date()
-  const currentHour = now.getHours()
-  const hourly = allHourly.filter((r) => r.hour <= currentHour)
-  if (!hourly.length) return null
+  const hourly = allHourly
 
-  // hourKeys 用于数据索引（HH:00 格式），hours 用于 X 轴显示
-  const hourKeys = hourly.map((r) => `${String(r.hour).padStart(2, '0')}:00`)
+  // hourKeys 用于数据索引（HH:00 / 昨 HH:00），hours 用于 X 轴显示
+  const hourKeys = hourly.map((r) => r.label ?? `${String(r.hour).padStart(2, '0')}:00`)
   const hours = [...hourKeys]
   // 最后一个坐标显示当前实时时间
   const nowLabel = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`
@@ -336,9 +337,9 @@ function buildTodayWave(): any | null {
     const matrix: Record<string, Record<string, { calls: number; total_tokens: number; cost: number }>> = {}
     for (const hr of hourKeys) matrix[hr] = {}
     for (const r of rows) {
-      const hrLabel = `${String(r.hour).padStart(2, '0')}:00`
-      if (hourKeys.includes(hrLabel)) {
-        matrix[hrLabel]![r.model] = { calls: Number(r.calls ?? 0), total_tokens: Number(r.total_tokens ?? 0), cost: Number(r.cost ?? 0) }
+      const lbl = r.label ?? `${String(r.hour).padStart(2, '0')}:00`
+      if (lbl in matrix) {
+        matrix[lbl]![r.model] = { calls: Number(r.calls ?? 0), total_tokens: Number(r.total_tokens ?? 0), cost: Number(r.cost ?? 0) }
       }
     }
     const meta = MODEL_METRIC_META[modelMetric.value]

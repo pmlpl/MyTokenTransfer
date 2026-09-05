@@ -173,21 +173,33 @@ async def usage(
     prompt_sum = sum(d["prompt_tokens"] for d in daily)
     cache_hit_rate = round(cached_tokens / prompt_sum * 100, 2) if prompt_sum > 0 else 0.0
 
-    # 今日视图：从 call_logs 按北京时间（UTC+8）小时聚合，用于波形图
+    # 近 24 小时滚动窗口：从 call_logs 按北京时间小时聚合，用于波形图。
+    # 不用"今日 0 点起"——跨过午夜后已过去的桶只剩一两个，折线缩成孤点，
+    # 昨晚的波形接不上；滚动窗口（含当前小时共 24 桶）让凌晨也有昨天的
+    # 尾巴可连。label 给昨天的桶带"昨"前缀，is_today 供前端把 KPI 口径
+    # 收窄回今日。
     hourly = []
     hourly_by_model = []
     if days == 1:
-        # 北京时间今日 00:00 对应 UTC 昨日 16:00
-        beijing_today = (datetime.now(timezone.utc) + timedelta(hours=8)).date()
-        day_start = datetime.combine(beijing_today, datetime.min.time()) - timedelta(hours=8)
-        day_end = day_start + timedelta(days=1)
+        bj_now = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=8)
+        bj_cur_hour = bj_now.replace(minute=0, second=0, microsecond=0)
+        win_start = bj_cur_hour - timedelta(hours=23) - timedelta(hours=8)  # UTC
+        win_end = bj_cur_hour + timedelta(hours=1) - timedelta(hours=8)
         model_field = func.coalesce(func.nullif(CallLog.native_model, ""), CallLog.virtual_model)
-        # 北京时间小时 = HOUR(created_at + INTERVAL 8 HOUR)
-        hour_expr = func.hour(func.date_add(CallLog.created_at, text("INTERVAL 8 HOUR")))
+        # 分桶必须带日期（HOUR 会把昨天 21 点和今天 21 点并成一桶）
+        bj_dt = func.date_add(CallLog.created_at, text("INTERVAL 8 HOUR"))
+        day_expr = func.date(bj_dt)
+        hour_expr = func.hour(bj_dt)
+
+        def bucket_label(bj_bucket: datetime) -> str:
+            if bj_bucket.date() == bj_now.date():
+                return bj_bucket.strftime("%H:00")
+            return f"昨 {bj_bucket:%H:00}"
 
         # 按小时聚合
         h_stmt = (
             select(
+                day_expr.label("d"),
                 hour_expr.label("hr"),
                 func.count(CallLog.id).label("calls"),
                 func.sum(CallLog.prompt_tokens).label("pt"),
@@ -196,16 +208,19 @@ async def usage(
                 func.sum(CallLog.cached_tokens).label("cached"),
                 func.sum(CallLog.cost).label("cost"),
             )
-            .where(CallLog.created_at >= day_start, CallLog.created_at < day_end)
-            .group_by(hour_expr)
-            .order_by(hour_expr)
+            .where(CallLog.created_at >= win_start, CallLog.created_at < win_end)
+            .group_by(day_expr, hour_expr)
+            .order_by(day_expr, hour_expr)
         )
         h_rows = (await db.execute(h_stmt)).all()
-        h_map = {int(r.hr): r for r in h_rows}
-        for hr in range(24):
-            r = h_map.get(hr)
+        h_map = {(r.d, int(r.hr)): r for r in h_rows}
+        for i in range(24):
+            bj_bucket = bj_cur_hour - timedelta(hours=23 - i)
+            r = h_map.get((bj_bucket.date(), bj_bucket.hour))
             hourly.append({
-                "hour": hr,
+                "hour": bj_bucket.hour,
+                "label": bucket_label(bj_bucket),
+                "is_today": bj_bucket.date() == bj_now.date(),
                 "calls": int(r.calls or 0) if r else 0,
                 "prompt_tokens": int(r.pt or 0) if r else 0,
                 "completion_tokens": int(r.ct or 0) if r else 0,
@@ -214,23 +229,28 @@ async def usage(
                 "cost": float(r.cost or 0) if r else 0.0,
             })
 
-        # 按小时×模型聚合
+        # 按小时×模型聚合（同一滚动窗口）
         hbm_stmt = (
             select(
+                day_expr.label("d"),
                 hour_expr.label("hr"),
                 model_field.label("m"),
                 func.count(CallLog.id).label("calls"),
                 func.sum(CallLog.total_tokens).label("tt"),
                 func.sum(CallLog.cost).label("cost"),
             )
-            .where(CallLog.created_at >= day_start, CallLog.created_at < day_end)
-            .group_by(hour_expr, model_field)
-            .order_by(hour_expr)
+            .where(CallLog.created_at >= win_start, CallLog.created_at < win_end)
+            .group_by(day_expr, hour_expr, model_field)
+            .order_by(day_expr, hour_expr)
         )
         hbm_rows = (await db.execute(hbm_stmt)).all()
         hourly_by_model = [
             {
                 "hour": int(r.hr),
+                "label": bucket_label(
+                    datetime.combine(r.d, datetime.min.time()) + timedelta(hours=int(r.hr))
+                ),
+                "is_today": r.d == bj_now.date(),
                 "model": str(r.m or "未知"),
                 "calls": int(r.calls or 0),
                 "total_tokens": int(r.tt or 0),
