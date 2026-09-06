@@ -1,4 +1,4 @@
-# MyTokenTransfer
+# <img src="frontend/public/logo.png" width="32" alt="MTT 品牌像素 Logo"> MyTokenTransfer
 
 自研轻量版 one-api/new-api：**API 密钥管理台 + OpenAI 兼容转发网关**，本地单机自用。
 
