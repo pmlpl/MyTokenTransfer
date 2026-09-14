@@ -50,3 +50,8 @@ Thumbs.db
 
 # ZCode session data
 .zcode/
+
+# Temp scripts & scratch workspace
+scripts/
+workspace/
+check_img.ps1

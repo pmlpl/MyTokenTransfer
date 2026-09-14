@@ -141,6 +141,24 @@ export interface AlertListResp {
   unresolved: number
 }
 
+export interface KeyModelStatusItem {
+  id: number
+  key_id: number
+  key_name: string
+  provider_id: number
+  provider_name: string | null
+  model_name: string
+  status: string
+  last_error: string | null
+  rate_limited_until: string | null
+  last_tested_at: string | null
+}
+
+export interface KeyModelStatusResp {
+  items: KeyModelStatusItem[]
+  total: number
+}
+
 export const api = {
   auth: {
     login: (password: string) =>
@@ -188,6 +206,8 @@ export const api = {
         .then((r) => r.data),
     usage: (days = 14) =>
       client.get<UsageResp>('/stats/usage', { params: { days } }).then((r) => r.data),
+    keyModelStatuses: () =>
+      client.get<KeyModelStatusResp>('/stats/key-model-statuses').then((r) => r.data),
   },
   pricing: {
     list: () => client.get<Pricing[]>('/pricing').then((r) => r.data),
@@ -200,6 +220,7 @@ export const api = {
     create: (data: Record<string, unknown>) => client.post<Channel>('/channels', data).then((r) => r.data),
     update: (id: number, data: Record<string, unknown>) => client.put<Channel>(`/channels/${id}`, data).then((r) => r.data),
     remove: (id: number) => client.delete(`/channels/${id}`),
+    test: (id: number) => client.post(`/channels/${id}/test`).then((r) => r.data),
   },
   logs: {
     list: (params?: { limit?: number; offset?: number; status?: string }) =>

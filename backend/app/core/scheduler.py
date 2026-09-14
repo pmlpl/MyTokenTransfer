@@ -7,8 +7,8 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from sqlalchemy import select
 
 from app.database import AsyncSessionLocal
-from app.models import ApiKey, KeyStatus
-from app.services.health_check import test_key
+from app.models import ApiKey, KeyModelStatus, KeyStatus
+from app.services.health_check import test_key, test_key_model_status
 from app.services.usage import rollup_date, rollup_recent
 
 log = structlog.get_logger()
@@ -54,6 +54,42 @@ async def sweep_degraded_keys() -> None:
                  skipped_exhausted=skipped_exhausted, recovered=recovered)
 
 
+async def sweep_degraded_model_statuses() -> None:
+    """周期巡检：重测所有非 active 的密钥×模型组合，恢复成功的转回 active。
+
+    与密钥级巡检互补：密钥级测的是 provider.models[0]，模型级测的是
+    用户实际使用的原生模型名（如 glm-5.2、deepseek-v4-flash）。
+    exhausted 状态距上次测试不足 EXHAUSTED_RETEST_MINUTES 则跳过。
+    """
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    async with AsyncSessionLocal() as db:
+        rows = await db.execute(
+            select(KeyModelStatus).where(KeyModelStatus.status.not_in([KeyStatus.active, KeyStatus.disabled]))
+        )
+        kms_list = list(rows.scalars())
+        if not kms_list:
+            return
+        recovered = 0
+        skipped_exhausted = 0
+        for kms in kms_list:
+            # exhausted 延长巡检间隔
+            if kms.status == KeyStatus.exhausted and kms.last_tested_at is not None:
+                if (now - kms.last_tested_at) < timedelta(minutes=EXHAUSTED_RETEST_MINUTES):
+                    skipped_exhausted += 1
+                    continue
+            try:
+                result = await test_key_model_status(db, kms)
+                if result.get("status") == "active":
+                    recovered += 1
+            except Exception as e:
+                log.warning("sweep_model_status_failed", id=kms.id, key_id=kms.key_id,
+                            model_name=kms.model_name, error=str(e))
+                continue
+        log.info("sweep_model_status_done", total=len(kms_list),
+                 tested=len(kms_list) - skipped_exhausted,
+                 skipped_exhausted=skipped_exhausted, recovered=recovered)
+
+
 async def rollup_yesterday() -> None:
     """每日固化前一天的用量聚合（凌晨跑，把昨天定为最终值）。"""
     from datetime import datetime, timedelta, timezone
@@ -83,6 +119,21 @@ def start_scheduler() -> None:
         sweep_degraded_keys,
         "date",
         id="sweep_first",
+        replace_existing=True,
+    )
+    # 密钥×模型细粒度状态巡检（测用户实际使用的模型名，而非 provider.models[0]）
+    scheduler.add_job(
+        sweep_degraded_model_statuses,
+        "interval",
+        minutes=SWEEP_INTERVAL_MINUTES,
+        id="sweep_degraded_model_statuses",
+        replace_existing=True,
+    )
+    # 启动后 35 秒跑一次首轮模型级巡检
+    scheduler.add_job(
+        sweep_degraded_model_statuses,
+        "date",
+        id="sweep_model_status_first",
         replace_existing=True,
     )
     # 每日凌晨 02:30 固化前一天的用量聚合

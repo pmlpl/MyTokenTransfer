@@ -9,7 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import require_auth
 from app.database import get_db
-from app.models import ApiKey, CallLog, DailyUsage, KeyStatus, Provider
+from app.models import ApiKey, CallLog, DailyUsage, KeyModelStatus, KeyStatus, Provider
 from app.services.usage import rollup_date
 
 router = APIRouter(
@@ -275,3 +275,42 @@ async def usage(
             "cost": float(t.cost or 0),
         },
     }
+
+
+@router.get("/key-model-statuses")
+async def key_model_statuses(db: AsyncSession = Depends(get_db)) -> dict:
+    """密钥×模型 细粒度状态列表（含密钥名、供应商名，供 Dashboard 展示）。"""
+    rows = await db.execute(
+        select(
+            KeyModelStatus.id,
+            KeyModelStatus.key_id,
+            KeyModelStatus.provider_id,
+            KeyModelStatus.model_name,
+            KeyModelStatus.status,
+            KeyModelStatus.last_error,
+            KeyModelStatus.rate_limited_until,
+            KeyModelStatus.last_tested_at,
+            ApiKey.name.label("key_name"),
+            ApiKey.key_mask,
+            Provider.name.label("provider_name"),
+        )
+        .join(ApiKey, ApiKey.id == KeyModelStatus.key_id)
+        .join(Provider, Provider.id == KeyModelStatus.provider_id)
+        .order_by(KeyModelStatus.key_id, KeyModelStatus.model_name)
+    )
+    items = [
+        {
+            "id": r.id,
+            "key_id": r.key_id,
+            "key_name": r.key_name or r.key_mask or f"key#{r.key_id}",
+            "provider_id": r.provider_id,
+            "provider_name": r.provider_name,
+            "model_name": r.model_name,
+            "status": r.status.value if hasattr(r.status, "value") else r.status,
+            "last_error": r.last_error,
+            "rate_limited_until": r.rate_limited_until.isoformat() if r.rate_limited_until else None,
+            "last_tested_at": r.last_tested_at.isoformat() if r.last_tested_at else None,
+        }
+        for r in rows.all()
+    ]
+    return {"items": items, "total": len(items)}

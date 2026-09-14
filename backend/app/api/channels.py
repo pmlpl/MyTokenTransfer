@@ -8,6 +8,7 @@ from sqlalchemy.orm import selectinload
 from app.core.deps import require_auth
 from app.database import get_db
 from app.models import ApiKey, Channel, ChannelKey, ChannelTier, ModelMapping, Provider
+from app.services.health_check import test_channel
 from app.schemas.channel import (
     ChannelCreate,
     ChannelOut,
@@ -194,6 +195,15 @@ async def update_channel(
     await db.commit()
     channel = await _load_full(channel.id, db)
     return await _serialize_full(channel, db)
+
+
+@router.post("/{channel_id}/test")
+async def test_channel_endpoint(channel_id: int, db: AsyncSession = Depends(get_db)) -> dict:
+    """按渠道探测：用该渠道实际对应的原生模型名测试其下所有密钥，结果写入 key_model_statuses。"""
+    channel = await _load_full(channel_id, db)
+    if not channel:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "通道不存在")
+    return await test_channel(db, channel)
 
 
 @router.delete("/{channel_id}", status_code=204)

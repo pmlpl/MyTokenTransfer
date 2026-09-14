@@ -23,6 +23,7 @@ from app.relay.balancer import (
     final_resort_keys,
     last_resort_keys,
     mark_key,
+    mark_key_model_status,
     mark_model_quota_limited,
     mark_tier_rate_limited,
     model_quota_is_limited,
@@ -32,6 +33,7 @@ from app.relay.balancer import (
     tier_is_rate_limited,
 )
 from app.relay.errors import classify_error, is_model_pool_quota
+from app.relay.token_bucket import acquire_token
 from app.services.health_check import _join
 
 log = structlog.get_logger("relay")
@@ -79,6 +81,17 @@ def _headers(raw_key: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {raw_key}", "Content-Type": "application/json"}
 
 
+# 上游网关读取请求体失败（实测 B.AI 网关对 >1MB 请求体偶发失败，返回
+# 400001 "read body failed"；同一上游换 key 无意义，应原地重试一次）。
+# 这不是 key 的状态问题，重试成功率高。
+_GATEWAY_READ_BODY_ERRORS = ("read body failed", "read_body_failed", "reading request body")
+
+
+def _is_gateway_read_body_error(err_text: str) -> bool:
+    text = (err_text or "").lower()
+    return any(m in text for m in _GATEWAY_READ_BODY_ERRORS)
+
+
 # 网络层瞬时故障重试：上游域名偶发 TLS 握手被掐/连接重置（SNI 阻断、NAT 抖动），
 # 同池所有 key 指向同一上游域名，换 key 重试没有意义，原地重试才有用。
 # 仅重试连接/发送阶段的异常（流未打开、请求未发出），HTTP 状态码一律交给 classify_error。
@@ -124,7 +137,8 @@ async def _build_attempts(
     for tier in tiers:
         if tier_is_rate_limited(tier.id):
             continue  # 同池短路：整层处于 TPM 冷却，跳过
-        keys = await ordered_keys(tier, channel.strategy, db, affinity)
+        native = await resolve_native(virtual, tier.provider_id, db)
+        keys = await ordered_keys(tier, channel.strategy, db, affinity, model_name=native)
         # 模型池冷却：该 key 上本模型的积分池刚报 429，跳过（其他模型不受影响）
         for k in keys[:max_retries]:
             if model_quota_is_limited(k.id, virtual):
@@ -146,7 +160,8 @@ async def _build_attempts(
         for tier in tiers:
             if tier_is_rate_limited(tier.id):
                 continue
-            keys = await ordered_keys(tier, channel.strategy, db, affinity)
+            native = await resolve_native(virtual, tier.provider_id, db)
+            keys = await ordered_keys(tier, channel.strategy, db, affinity, model_name=native)
             for k in keys[:max_retries]:
                 if model_quota_is_limited(k.id, virtual):
                     attempts.append((tier, k))
@@ -218,6 +233,9 @@ async def route_chat_completions(
         if model_quota_is_limited(key.id, virtual) and not allow_quota_limited:
             continue  # 模型池冷却：该 key 上本模型的积分池刚报 429
         native = await resolve_native(virtual, tier.provider_id, db)
+        # 令牌桶事前控速：该 key+模型无令牌时跳过，换下一把 key（多密钥池自动负载）
+        if not acquire_token(key.id, native):
+            continue
         base = base_url_for(tier.provider)
         if not base:
             last_error = f"供应商 {tier.provider.slug} 缺少 base_url"
@@ -234,34 +252,61 @@ async def route_chat_completions(
 
         if stream:
             client = httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=10.0))
-            try:
-                response = await _send_with_retry(
-                    client, url, headers=_headers(raw), json=payload, stream=True
-                )
-            except Exception as e:
-                await client.aclose()
-                last_error = f"{type(e).__name__}: {e}"
-                continue  # 瞬时网络错误，换下一个
-            if response.status_code != 200:
-                await response.aread()
-                err_text = response.text
-                await response.aclose()
-                await client.aclose()
-                retry, mark, msg = classify_error(response.status_code, err_text)
-                if mark == KeyStatus.rate_limited:
-                    mark_tier_rate_limited(tier.id)  # 同池短路：整层 TPM 冷却
-                elif mark == KeyStatus.exhausted and is_model_pool_quota(err_text):
-                    # 模型池级额度耗尽：只冷却 (key, 模型) 组合，不把整把 key 标死
-                    mark_model_quota_limited(key.id, virtual)
-                else:
-                    await mark_key(key, mark, db, message=msg)
-                last_error = msg
-                if retry:
-                    continue
-                return JSONResponse(
-                    status_code=response.status_code,
-                    content={"error": {"message": msg, "type": "upstream_error"}},
-                )
+            same_key_retry = 0  # 上游网关 read body failed 原地重试计数
+            should_continue = False  # 需要换下一个 key 时置 True
+            while True:
+                try:
+                    response = await _send_with_retry(
+                        client, url, headers=_headers(raw), json=payload, stream=True
+                    )
+                except Exception as e:
+                    await client.aclose()
+                    last_error = f"{type(e).__name__}: {e}"
+                    should_continue = True  # 网络异常不原地重试，走外层换 key
+                    break
+                if response.status_code != 200:
+                    await response.aread()
+                    err_text = response.text
+                    await response.aclose()
+                    # 上游网关读 body 失败（B.AI 对 >1MB 请求体偶发）：
+                    # 同一上游换 key 无意义，原地重试一次，成功率高
+                    if _is_gateway_read_body_error(err_text) and same_key_retry < 1:
+                        same_key_retry += 1
+                        log.warning(
+                            "gateway_read_body_retry",
+                            channel_id=channel.id, key_id=key.id, provider_id=tier.provider_id,
+                            virtual_model=virtual, native_model=native,
+                            err_text=err_text[:200],
+                        )
+                        await asyncio.sleep(3)
+                        continue
+                    await client.aclose()
+                    retry, mark, msg = classify_error(response.status_code, err_text)
+                    _is_model_quota = is_model_pool_quota(err_text) or "entitlement" in (err_text or "").lower()
+                    if mark == KeyStatus.rate_limited:
+                        mark_tier_rate_limited(tier.id)  # 同池短路：整层 TPM 冷却
+                        await mark_key_model_status(db, key_id=key.id, provider_id=tier.provider_id, model_name=native, status=mark, message=msg)
+                    elif mark == KeyStatus.exhausted and _is_model_quota:
+                        # 模型池级额度耗尽（含 SenseNova token plan entitlement）：只标记 (key, 模型)，不把整把 key 标死
+                        mark_model_quota_limited(key.id, virtual)
+                        await mark_key_model_status(db, key_id=key.id, provider_id=tier.provider_id, model_name=native, status=mark, message=msg)
+                    elif mark == KeyStatus.invalid and "no access to model" in (err_text or "").lower():
+                        # 模型访问权限不足：密钥本身有效，只标记模型级 invalid
+                        await mark_key_model_status(db, key_id=key.id, provider_id=tier.provider_id, model_name=native, status=mark, message=msg)
+                    else:
+                        await mark_key(key, mark, db, message=msg)
+                    last_error = msg
+                    if retry:
+                        should_continue = True  # 换下一个 key（外层 for 继续）
+                        break
+                    return JSONResponse(
+                        status_code=response.status_code,
+                        content={"error": {"message": msg, "type": "upstream_error"}},
+                    )
+                # 200：流已打开，退出 while
+                break
+            if should_continue:
+                continue  # 网络异常或可重试错误，换下一个 key
             # 200：流已打开，故障转移窗口关闭
             await _revive_if_exhausted(key, db)
             meta = {
@@ -302,11 +347,17 @@ async def route_chat_completions(
                 )
                 return JSONResponse(status_code=200, content=data)
             retry, mark, msg = classify_error(resp.status_code, resp.text)
+            _is_model_quota = is_model_pool_quota(resp.text) or "entitlement" in (resp.text or "").lower()
             if mark == KeyStatus.rate_limited:
                 mark_tier_rate_limited(tier.id)  # 同池短路：整层 TPM 冷却
-            elif mark == KeyStatus.exhausted and is_model_pool_quota(resp.text):
-                # 模型池级额度耗尽：只冷却 (key, 模型) 组合，不把整把 key 标死
+                await mark_key_model_status(db, key_id=key.id, provider_id=tier.provider_id, model_name=native, status=mark, message=msg)
+            elif mark == KeyStatus.exhausted and _is_model_quota:
+                # 模型池级额度耗尽（含 SenseNova token plan entitlement）：只标记 (key, 模型)，不把整把 key 标死
                 mark_model_quota_limited(key.id, virtual)
+                await mark_key_model_status(db, key_id=key.id, provider_id=tier.provider_id, model_name=native, status=mark, message=msg)
+            elif mark == KeyStatus.invalid and "no access to model" in (resp.text or "").lower():
+                # 模型访问权限不足：密钥本身有效，只标记模型级 invalid
+                await mark_key_model_status(db, key_id=key.id, provider_id=tier.provider_id, model_name=native, status=mark, message=msg)
             else:
                 await mark_key(key, mark, db, message=msg)
             await write_call_log(
@@ -412,6 +463,9 @@ async def route_embeddings(channel: Channel, body: dict, db: AsyncSession) -> JS
         if model_quota_is_limited(key.id, virtual) and not allow_quota_limited:
             continue  # 模型池冷却：该 key 上本模型的积分池刚报 429
         native = await resolve_native(virtual, tier.provider_id, db)
+        # 令牌桶事前控速：该 key+模型无令牌时跳过，换下一把 key（多密钥池自动负载）
+        if not acquire_token(key.id, native):
+            continue
         base = base_url_for(tier.provider)
         if not base:
             last_error = f"供应商 {tier.provider.slug} 缺少 base_url"
@@ -452,11 +506,197 @@ async def route_embeddings(channel: Channel, body: dict, db: AsyncSession) -> JS
             )
             return JSONResponse(status_code=200, content=data)
         retry, mark, msg = classify_error(resp.status_code, resp.text)
+        _is_model_quota = is_model_pool_quota(resp.text) or "entitlement" in (resp.text or "").lower()
         if mark == KeyStatus.rate_limited:
             mark_tier_rate_limited(tier.id)  # 同池短路：整层 TPM 冷却
-        elif mark == KeyStatus.exhausted and is_model_pool_quota(resp.text):
-            # 模型池级额度耗尽：只冷却 (key, 模型) 组合，不把整把 key 标死
+            await mark_key_model_status(db, key_id=key.id, provider_id=tier.provider_id, model_name=native, status=mark, message=msg)
+        elif mark == KeyStatus.exhausted and _is_model_quota:
+            # 模型池级额度耗尽（含 SenseNova token plan entitlement）：只标记 (key, 模型)，不把整把 key 标死
             mark_model_quota_limited(key.id, virtual)
+            await mark_key_model_status(db, key_id=key.id, provider_id=tier.provider_id, model_name=native, status=mark, message=msg)
+        elif mark == KeyStatus.invalid and "no access to model" in (resp.text or "").lower():
+            # 模型访问权限不足：密钥本身有效，只标记模型级 invalid
+            await mark_key_model_status(db, key_id=key.id, provider_id=tier.provider_id, model_name=native, status=mark, message=msg)
+        else:
+            await mark_key(key, mark, db, message=msg)
+        await write_call_log(
+            channel_id=channel.id,
+            tier_order=tier.order,
+            provider_id=tier.provider_id,
+            key_id=key.id,
+            virtual_model=virtual,
+            native_model=native,
+            usage=None,
+            latency_ms=latency_ms,
+            status="error",
+            error=msg,
+            stream=False,
+        )
+        last_error = msg
+        if retry:
+            continue
+        return JSONResponse(
+            status_code=resp.status_code,
+            content={"error": {"message": msg, "type": "upstream_error"}},
+        )
+
+    log.warning(
+        "all_upstreams_failed",
+        channel_id=channel.id,
+        virtual_model=virtual,
+        error=last_error,
+    )
+    return JSONResponse(
+        status_code=502,
+        content={"error": {"message": f"所有上游均失败：{last_error}", "type": "all_upstreams_failed"}},
+    )
+
+
+def _build_image_payload(body: dict, native_model: str) -> dict:
+    """构造 images/generations 请求体。
+
+    agent 经 chat/completions 发来的 body 只有 messages 没有 prompt，
+    这里提取最后一条 user 消息的文本作为 prompt，并剔除 chat 专用字段。
+    """
+    payload = dict(body)
+    payload["model"] = native_model
+    if not payload.get("prompt"):
+        prompt = ""
+        for m in payload.get("messages") or []:
+            if not isinstance(m, dict):
+                continue
+            content = m.get("content")
+            if isinstance(content, str):
+                prompt = content  # 取最后一条文本消息
+            elif isinstance(content, list):
+                parts = []
+                for seg in content:
+                    if isinstance(seg, dict) and isinstance(seg.get("text"), str):
+                        parts.append(seg["text"])
+                    elif isinstance(seg, dict) and isinstance(seg.get("type"), str) and seg.get("type") == "text":
+                        parts.append(str(seg.get("text", "")))
+                if parts:
+                    prompt = " ".join(parts)
+        if not prompt:
+            raise ValueError("无法从 messages 提取生图 prompt")
+        payload["prompt"] = prompt
+    for key in ("messages", "stream", "max_tokens", "temperature", "top_p", "reasoning_effort", "thinking"):
+        payload.pop(key, None)
+    if "n" not in payload:
+        payload["n"] = 1
+    return payload
+
+
+def _wrap_image_as_chat(data: dict, virtual_model: str) -> dict:
+    """把 /v1/images/generations 的响应包装成 OpenAI chat.completion 格式。
+
+    agent 客户端只认 chat/completions，把生图结果以 markdown 图片形式
+    放进 message.content，客户端即可直接展示图片。
+    """
+    urls = []
+    for item in data.get("data") or []:
+        if item.get("url"):
+            urls.append(item["url"])
+        elif item.get("b64_json"):
+            urls.append(f"data:image/png;base64,{item['b64_json']}")
+    text = "\n".join(f"![image]({u})" for u in urls) if urls else "(图片生成失败，无返回数据)"
+    return {
+        "id": f"chatcmpl-img-{int(time.time() * 1000)}",
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": virtual_model,
+        "choices": [
+            {
+                "index": 0,
+                "message": {"role": "assistant", "content": text},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+    }
+
+
+async def route_image_generations(
+    channel: Channel, body: dict, db: AsyncSession, wrap_as_chat: bool = False
+) -> JSONResponse:
+    """/v1/images/generations：复用同一套 Tier fallback + 池内负载均衡 + key 状态机。
+
+    与 chat/embeddings 同构：按 (tier, key) 尝试序列逐个发上游，
+    命中可恢复错误就标状态并换下一个，成功/失败都写 CallLog。
+    图片生成不支持流式，超时给得更长（120s）。
+    """
+    virtual = channel.virtual_model
+    affinity = routing_affinity(virtual, body)
+
+    attempts = await _build_attempts(channel, db, affinity)
+    if not attempts:
+        log.warning("no_available_key", channel_id=channel.id, virtual_model=virtual)
+        return _no_key_response()
+
+    last_error = "无可用上游"
+    allow_quota_limited, allow_tier_limited = _cooldown_exemptions(attempts, virtual)
+    for tier, key in attempts:
+        if tier_is_rate_limited(tier.id) and not allow_tier_limited:
+            continue
+        if model_quota_is_limited(key.id, virtual) and not allow_quota_limited:
+            continue
+        native = await resolve_native(virtual, tier.provider_id, db)
+        # 令牌桶事前控速：该 key+模型无令牌时跳过，换下一把 key
+        if not acquire_token(key.id, native):
+            continue
+        base = base_url_for(tier.provider)
+        if not base:
+            last_error = f"供应商 {tier.provider.slug} 缺少 base_url"
+            continue
+        url = _join(base, "images/generations")
+        try:
+            raw = decrypt_value(key.key_value)
+        except Exception:
+            await mark_key(key, KeyStatus.invalid, db, message="密文解密失败")
+            continue
+
+        try:
+            payload = _build_image_payload(body, native)
+        except ValueError as e:
+            last_error = str(e)
+            continue
+        t0 = time.time()
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(120.0, connect=10.0)) as client:
+                resp = await _send_with_retry(client, url, headers=_headers(raw), json=payload)
+        except Exception as e:
+            last_error = f"{type(e).__name__}: {e}"
+            continue
+        latency_ms = int((time.time() - t0) * 1000)
+        if resp.status_code == 200:
+            data = resp.json()
+            await _revive_if_exhausted(key, db)
+            await write_call_log(
+                channel_id=channel.id,
+                tier_order=tier.order,
+                provider_id=tier.provider_id,
+                key_id=key.id,
+                virtual_model=virtual,
+                native_model=native,
+                usage=None,
+                latency_ms=latency_ms,
+                status="success",
+                error=None,
+                stream=False,
+            )
+            if wrap_as_chat:
+                return JSONResponse(status_code=200, content=_wrap_image_as_chat(data, virtual))
+            return JSONResponse(status_code=200, content=data)
+        retry, mark, msg = classify_error(resp.status_code, resp.text)
+        _is_model_quota = is_model_pool_quota(resp.text) or "entitlement" in (resp.text or "").lower()
+        if mark == KeyStatus.rate_limited:
+            mark_tier_rate_limited(tier.id)
+            await mark_key_model_status(db, key_id=key.id, provider_id=tier.provider_id, model_name=native, status=mark, message=msg)
+        elif mark == KeyStatus.exhausted and _is_model_quota:
+            mark_model_quota_limited(key.id, virtual)
+            await mark_key_model_status(db, key_id=key.id, provider_id=tier.provider_id, model_name=native, status=mark, message=msg)
+        elif mark == KeyStatus.invalid and "no access to model" in (resp.text or "").lower():
+            await mark_key_model_status(db, key_id=key.id, provider_id=tier.provider_id, model_name=native, status=mark, message=msg)
         else:
             await mark_key(key, mark, db, message=msg)
         await write_call_log(

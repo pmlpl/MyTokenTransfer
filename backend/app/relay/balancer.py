@@ -13,7 +13,7 @@ import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import ApiKey, ChannelKey, ChannelTier, KeyStatus, ModelMapping
+from app.models import ApiKey, ChannelKey, ChannelTier, KeyModelStatus, KeyStatus, ModelMapping
 from app.models.enums import KeyStrategy
 from app.services.health_check import _DEFAULT_BASES, _join
 
@@ -148,8 +148,13 @@ async def ordered_keys(
     strategy: KeyStrategy,
     db: AsyncSession,
     affinity: int = 0,
+    model_name: str | None = None,
 ) -> list[ApiKey]:
-    """层内按策略排序的可用密钥（跳过非 active / 限流冷却中）。
+    """层内按策略排序的可用密钥（跳过非 active / 限流冷却中 / 模型级不可用）。
+
+    model_name 为当前渠道在该供应商上的原生模型名；传入后额外检查
+    key_model_statuses，跳过该模型上 exhausted/invalid/冷却中的密钥。
+    无记录视为默认 active。
 
     affinity=0 时行为与旧版一致（round_robin 即 id 升序、weighted 即随机洗牌），
     保证向后兼容；传入非 0 亲和哈希后，同会话确定性固定同一 key，
@@ -168,6 +173,14 @@ async def ordered_keys(
                 continue
         elif ak.status != KeyStatus.active:
             continue
+        # 模型级细粒度状态：该密钥在当前模型上 exhausted/invalid/冷却中则跳过
+        if model_name:
+            kms = await get_key_model_status(db, ak.id, model_name)
+            if kms is not None:
+                if kms.status != KeyStatus.active:
+                    continue
+                if kms.rate_limited_until and kms.rate_limited_until > now_utc():
+                    continue
         pairs.append((ck, ak))
 
     if strategy == KeyStrategy.priority:
@@ -281,4 +294,64 @@ async def mark_key(
     # key 从非 active 恢复为 active → 自动 resolve 其历史未解决告警
     if status == KeyStatus.active and before != KeyStatus.active:
         await resolve_key_alerts(db, key.id)
+    await db.commit()
+
+
+async def get_key_model_status(
+    db: AsyncSession, key_id: int, model_name: str
+) -> KeyModelStatus | None:
+    """查询密钥在某个原生模型上的细粒度状态（无记录表示默认 active）。"""
+    return await db.scalar(
+        select(KeyModelStatus).where(
+            KeyModelStatus.key_id == key_id, KeyModelStatus.model_name == model_name
+        )
+    )
+
+
+async def mark_key_model_status(
+    db: AsyncSession,
+    *,
+    key_id: int,
+    provider_id: int,
+    model_name: str,
+    status: KeyStatus | None,
+    message: str | None = None,
+) -> None:
+    """标记密钥在某个原生模型上的细粒度状态（upsert）。
+
+    status=None 时不改变状态，仅更新 last_error/last_tested_at。
+    无记录时自动插入（默认 active），有记录时更新。
+    """
+    kms = await get_key_model_status(db, key_id, model_name)
+    now = now_utc()
+    if kms is None:
+        kms = KeyModelStatus(
+            key_id=key_id,
+            provider_id=provider_id,
+            model_name=model_name,
+            status=status or KeyStatus.active,
+            last_error=message,
+            last_tested_at=now,
+        )
+        if status == KeyStatus.rate_limited:
+            kms.rate_limited_until = now + timedelta(seconds=_RATE_LIMIT_COOLDOWN)
+        db.add(kms)
+    else:
+        if status is not None:
+            kms.status = status
+        if message is not None:
+            kms.last_error = message
+        kms.last_tested_at = now
+        if status == KeyStatus.rate_limited:
+            kms.rate_limited_until = now + timedelta(seconds=_RATE_LIMIT_COOLDOWN)
+        elif status != KeyStatus.rate_limited:
+            kms.rate_limited_until = None
+    log.warning(
+        "key_model_status_changed",
+        key_id=key_id,
+        provider_id=provider_id,
+        model_name=model_name,
+        status=(status.value if status else None),
+        message=message,
+    )
     await db.commit()

@@ -53,6 +53,10 @@ def classify_error(status_code: int, body_text: str) -> tuple[bool, KeyStatus | 
     text = (body_text or "").lower()
     snippet = (body_text or "")[:200]
     if status_code in (401, 403):
+        # 模型访问权限不足（如 "no access to model"）：密钥本身有效，
+        # 只是该模型不可用/名称不对，不应标 invalid 污染全局密钥状态。
+        if "no access to model" in text or "model access" in text:
+            return False, None, f"HTTP {status_code}: {snippet}"
         return True, KeyStatus.invalid, f"HTTP {status_code}: {snippet}"
     if status_code == 429:
         # 优先判瞬时限流：TPM/RPM 等速率限制是短时的，60秒冷却后恢复
