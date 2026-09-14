@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 import httpx
+import structlog
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -14,6 +15,8 @@ from app.database import AsyncSessionLocal
 from app.models import ApiKey, KeyStatus, Provider
 from app.models.enums import ProbeKind
 from app.relay.errors import classify_error
+
+log = structlog.get_logger("health_check")
 
 # 各供应商默认基址（provider.base_url 为空时兜底）
 _DEFAULT_BASES = {
@@ -35,6 +38,17 @@ _PROBE_ATTEMPTS = 3
 _RETRY_BACKOFF = 1.0  # 秒
 
 _VERSION_TAIL = re.compile(r"/v\d+$")
+
+# 生图模型名特征词：与 app.api.relay._IMAGE_MODEL_HINTS 保持一致。
+# 生图模型不走 chat/completions 端点（上游回 400 invalid_request），
+# 探测时需识别并改用列模型接口或跳过。
+_IMAGE_MODEL_HINTS = ("image", "img", "t2i", "dall-e", "sora", "flux", "midjourney")
+
+
+def _is_image_model_name(model_name: str) -> bool:
+    """判断模型名是否为生图模型（不适用 chat/completions 探测）。"""
+    name = model_name.lower()
+    return any(h in name for h in _IMAGE_MODEL_HINTS)
 
 
 @dataclass
@@ -157,13 +171,23 @@ async def _probe_anthropic_chat(base: str, headers: dict[str, str], model: str) 
     )
 
 
-async def _probe(provider: Provider, raw_key: str) -> ProbeResult:
+async def _probe(provider: Provider, raw_key: str, model_name: str | None = None) -> ProbeResult:
     base = provider.base_url or _DEFAULT_BASES.get(provider.slug, "")
     if not base:
         return ProbeResult(False, None, None, "缺少 base_url 且无默认值")
 
     if provider.probe_kind == ProbeKind.openai_models:
         headers = {"Authorization": f"Bearer {raw_key}"}
+        # 指定模型名时跳过列模型接口（它不验证具体模型可用性），直接用对话探测
+        if model_name:
+            # 生图模型不走 chat/completions（上游回 400 invalid_request），
+            # 退到列模型接口验证密钥有效性；接口不可用时跳过，不标失败
+            if _is_image_model_name(model_name):
+                result = await _probe_models(base, headers)
+                if result is not None:
+                    return result
+                return ProbeResult(True, None, None, None, via="skip")
+            return await _probe_chat(base, headers, model_name)
         result = await _probe_models(base, headers)
         if result is not None:
             return result
@@ -252,8 +276,8 @@ def _now() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
-async def test_key(db: AsyncSession, key: ApiKey) -> dict:
-    """探测单条密钥并更新状态。"""
+async def test_key(db: AsyncSession, key: ApiKey, model_name: str | None = None) -> dict:
+    """探测单条密钥并更新状态。model_name 指定时用该模型名做对话探测。"""
     from app.services.alerts import emit_key_alert, resolve_key_alerts
 
     before = key.status
@@ -277,7 +301,7 @@ async def test_key(db: AsyncSession, key: ApiKey) -> dict:
         await db.commit()
         return {"id": key.id, "status": key.status.value, "ok": False, "error": key.last_error}
 
-    result = await _probe(key.provider, raw)
+    result = await _probe(key.provider, raw, model_name=model_name)
     new_status, err, rlu = _classify(result, key.status, key.rate_limited_until, key.last_tested_at)
     key.status = new_status
     key.last_error = err
@@ -337,3 +361,154 @@ async def test_keys(
 
     results = await asyncio.gather(*[_test_one(kid) for kid in key_ids])
     return list(results)
+
+
+async def test_key_model_status(db: AsyncSession, kms) -> dict:
+    """探测某个密钥×模型组合并更新 key_model_statuses 状态。
+
+    用于巡检恢复：模型级 exhausted/rate_limited 的组合定期复测，
+    成功后转回 active。用 kms.model_name（原生模型名）直接探测，
+    不再走 provider.models[0]，确保测的就是用户实际用的模型。
+    """
+    from app.models import ApiKey, KeyStatus, Provider
+
+    key = await db.get(ApiKey, kms.key_id)
+    if not key:
+        return {"id": kms.id, "ok": False, "error": "密钥不存在"}
+    if key.status == KeyStatus.disabled:
+        return {"id": kms.id, "ok": False, "error": "密钥已手动停用"}
+    try:
+        raw = decrypt_value(key.key_value)
+    except Exception:
+        kms.status = KeyStatus.invalid
+        kms.last_error = "密文解密失败"
+        kms.last_tested_at = _now()
+        await db.commit()
+        return {"id": kms.id, "ok": False, "error": "密文解密失败"}
+
+    result = await _probe(key.provider, raw, model_name=kms.model_name)
+    now = _now()
+    kms.last_tested_at = now
+    if result.ok:
+        # rate_limited 冷却未到期：1-token 成功不代表限流解除，保留冷却
+        if kms.status == KeyStatus.rate_limited and kms.rate_limited_until and kms.rate_limited_until > now:
+            pass
+        else:
+            before = kms.status
+            kms.status = KeyStatus.active
+            kms.last_error = None
+            kms.rate_limited_until = None
+            if before != KeyStatus.active:
+                log.info("key_model_status_recovered", key_id=kms.key_id, model_name=kms.model_name, before=before.value)
+    else:
+        _retry, status, msg = classify_error(result.http_status or 0, result.body or "")
+        if status == KeyStatus.rate_limited:
+            kms.status = status
+            kms.rate_limited_until = now + timedelta(seconds=_RATE_LIMIT_COOLDOWN)
+            kms.last_error = msg
+        elif status is not None:
+            kms.status = status
+            kms.last_error = msg
+            kms.rate_limited_until = None
+        # 5xx/未知：保留原状态，仅记录错误
+        elif result.error:
+            kms.last_error = result.error
+    await db.commit()
+    return {
+        "id": kms.id,
+        "key_id": kms.key_id,
+        "model_name": kms.model_name,
+        "status": kms.status.value,
+        "ok": result.ok,
+        "error": kms.last_error,
+    }
+
+
+async def test_channel(db: AsyncSession, channel) -> dict:
+    """按渠道探测：用渠道实际对应的原生模型名测试该渠道下所有密钥。
+
+    与 test_key（用 provider.models[0]）不同，这里对每个 tier 先
+    resolve_native 得到用户实际路由的原生模型名，再用该模型名探测，
+    结果写入 key_model_statuses（密钥×模型细粒度状态），不污染密钥全局状态。
+    """
+    from app.relay.balancer import mark_key_model_status, resolve_native
+    from app.models import Channel, KeyStatus
+
+    # 收集所有 (tier, key) 对，按 tier 解析原生模型名
+    targets: list[dict] = []
+    seen: set[tuple[int, str]] = set()
+    for tier in channel.tiers:
+        native = await resolve_native(channel.virtual_model, tier.provider_id, db)
+        for ck in tier.keys:
+            if not ck.api_key:
+                continue
+            if ck.api_key.status == KeyStatus.disabled:
+                continue
+            kkey = (ck.api_key.id, native)
+            if kkey in seen:
+                continue
+            seen.add(kkey)
+            targets.append({
+                "key_id": ck.api_key.id,
+                "key_name": ck.api_key.name or ck.api_key.key_mask or f"key#{ck.api_key.id}",
+                "provider_id": tier.provider_id,
+                "provider_name": tier.provider.name if tier.provider else None,
+                "tier_order": tier.order,
+                "native_model": native,
+            })
+
+    if not targets:
+        return {"channel_id": channel.id, "virtual_model": channel.virtual_model, "results": [], "total": 0}
+
+    sem = asyncio.Semaphore(_BATCH_CONCURRENCY)
+
+    async def _probe_one(t: dict) -> dict:
+        async with sem:
+            async with AsyncSessionLocal() as sdb:
+                from app.models import ApiKey
+                key = await sdb.get(ApiKey, t["key_id"])
+                if not key:
+                    return {**t, "ok": False, "error": "密钥不存在", "status": "unknown"}
+                try:
+                    raw = decrypt_value(key.key_value)
+                except Exception:
+                    await mark_key_model_status(
+                        sdb, key_id=key.id, provider_id=t["provider_id"],
+                        model_name=t["native_model"], status=KeyStatus.invalid, message="密文解密失败",
+                    )
+                    return {**t, "ok": False, "error": "密文解密失败", "status": "invalid"}
+
+                result = await _probe(key.provider, raw, model_name=t["native_model"])
+                now = _now()
+                if result.ok:
+                    status = KeyStatus.active
+                    err = None
+                else:
+                    _retry, status, msg = classify_error(result.http_status or 0, result.body or "")
+                    if status is None:
+                        status = KeyStatus.rate_limited if result.http_status == 429 else key.status
+                    err = msg or result.error
+                await mark_key_model_status(
+                    sdb, key_id=key.id, provider_id=t["provider_id"],
+                    model_name=t["native_model"], status=status, message=err,
+                )
+                return {
+                    **t,
+                    "ok": result.ok,
+                    "status": status.value if hasattr(status, "value") else str(status),
+                    "error": err,
+                    "http_status": result.http_status,
+                    "via": result.via,
+                }
+
+    results = await asyncio.gather(*[_probe_one(t) for t in targets])
+    ok_count = sum(1 for r in results if r.get("ok"))
+    return {
+        "channel_id": channel.id,
+        "channel_name": channel.name,
+        "virtual_model": channel.virtual_model,
+        "total": len(results),
+        "ok": ok_count,
+        "failed": len(results) - ok_count,
+        "results": list(results),
+    }

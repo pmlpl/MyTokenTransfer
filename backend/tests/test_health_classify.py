@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from app.models.enums import KeyStatus
-from app.services.health_check import ProbeResult, _classify
+from app.services.health_check import ProbeResult, _classify, _is_image_model_name
 
 
 def _probe(ok, status, body="") -> ProbeResult:
@@ -55,3 +55,16 @@ def test_network_error_keeps_current_and_preserves_message():
     assert status == KeyStatus.exhausted  # 保留原状态
     assert err == "ConnectError: timed out"
     assert rlu is None
+
+
+# ---- 生图模型探测跳过 ----
+# 生图模型（如 agnes-image-2.5-flash）不走 chat/completions 端点，用对话探测
+# 会吃 400 invalid_request。_probe 识别后应退到列模型接口或跳过，不标失败。
+def test_image_model_name_detection():
+    assert _is_image_model_name("agnes-image-2.5-flash")
+    assert _is_image_model_name("dall-e-3")
+    assert _is_image_model_name("flux-pro")
+    assert _is_image_model_name("sora-2")
+    assert not _is_image_model_name("gpt-4o")
+    assert not _is_image_model_name("deepseek-v4-flash")
+    assert not _is_image_model_name("claude-sonnet-4")
