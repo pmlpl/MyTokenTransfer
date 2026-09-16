@@ -48,37 +48,22 @@
 
 ## 架构总览
 
-```
-                    ┌──────────────────────────────────────────┐
-   任意 OpenAI      │           管理台（Vue3 + Naive UI）        │
-   兼容客户端  ──┐  │  密钥 / 供应商 / 通道 / 日志 / 用量 / 定价  │
-   (Cline/Cursor │  └────────────────┬─────────────────────────┘
-    /自研 Agent) │                   │ Bearer <session-token>
-                 │                   │  /api/*  (登录态)
-                 ▼                   ▼
-        ┌────────────────────────────────────────────┐
-        │      nginx (frontend 容器, 对外唯一入口)      │
-        │   /api/* → backend:8082   /v1/* → backend   │
-        └────────────────┬───────────────────────────┘
-                         │ Bearer <GATEWAY_TOKEN>
-                         ▼
-        ┌────────────────────────────────────────────┐
-        │   FastAPI backend :8082                    │
-        │   relay/gateway  ← 编排尝试序列 + 流式透传    │
-        │   relay/balancer ← Tier 调度 / 状态机 / 兜底  │
-        │   relay/token_bucket ← 事前限速              │
-        │   relay/accounting   ← 计费落库              │
-        │   core/scheduler     ← APScheduler 巡检      │
-        └───────┬─────────────────────────┬──────────┘
-                │ SQLAlchemy 2.0 async    │ httpx 直连
-                ▼                         ▼
-        ┌───────────────┐        ┌────────────────────────┐
-        │ MySQL 8.0     │        │ 上游 OpenAI 兼容端点       │
-        │ (12 张表)      │        │ (多中转商 / 官方 API)      │
-        └───────────────┘        └────────────────────────┘
-        ┌───────────────┐
-        │ Redis 7        │  ← compose 中已起服务，但当前应用代码未接线（见下方说明）
-        └───────────────┘
+```mermaid
+flowchart TD
+    Client["任意 OpenAI 兼容客户端<br/>Cline / Cursor / 自研 Agent"]
+    UI["管理台 Vue3 + Naive UI<br/>密钥/供应商/通道/日志/用量/定价"]
+    Nginx["nginx (frontend, 对外唯一入口)<br/>/api/* → backend:8082<br/>/v1/* → backend"]
+    Backend["FastAPI backend :8082<br/>gateway / balancer / token_bucket<br/>accounting / scheduler"]
+    MySQL[("MySQL 8.0 — 12 张表")]
+    Upstream["上游 OpenAI 兼容端点<br/>多中转商 / 官方 API"]
+    Redis[("Redis 7 — 未接线")]
+
+    Client -->|"/v1/* Bearer GATEWAY_TOKEN"| Nginx
+    UI -->|"/api/* Bearer session-token"| Nginx
+    Nginx --> Backend
+    Backend -->|SQLAlchemy async| MySQL
+    Backend -->|httpx 直连| Upstream
+    Backend -.->|未调用| Redis
 ```
 
 > [!IMPORTANT]
