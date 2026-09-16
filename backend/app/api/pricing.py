@@ -5,6 +5,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.cache import cache_delete
 from app.core.deps import require_auth
 from app.database import get_db
 from app.models import ModelPricing
@@ -33,6 +34,7 @@ async def create_pricing(body: PricingCreate, db: AsyncSession = Depends(get_db)
         await db.rollback()
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "model_name 已存在")
     await db.refresh(p)
+    await cache_delete(f"price:{p.model_name}")
     return p
 
 
@@ -47,6 +49,7 @@ async def update_pricing(
         setattr(p, k, v)
     await db.commit()
     await db.refresh(p)
+    await cache_delete(f"price:{p.model_name}")
     return p
 
 
@@ -55,5 +58,7 @@ async def delete_pricing(pricing_id: int, db: AsyncSession = Depends(get_db)) ->
     p = await db.get(ModelPricing, pricing_id)
     if not p:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "计价记录不存在")
+    model_name = p.model_name
     await db.delete(p)
     await db.commit()
+    await cache_delete(f"price:{model_name}")

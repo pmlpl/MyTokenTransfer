@@ -5,6 +5,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.core.cache import cache_scan_delete
 from app.core.deps import require_auth
 from app.database import get_db
 from app.models import ApiKey, Channel, ChannelKey, ChannelTier, ModelMapping, Provider
@@ -143,6 +144,7 @@ async def create_channel(body: ChannelCreate, db: AsyncSession = Depends(get_db)
         db.add(ModelMapping(virtual_model=channel.virtual_model, provider_id=m_in.provider_id, native_model=m_in.native_model))
 
     await db.commit()
+    await cache_scan_delete(f"mm:{channel.virtual_model}:*")
     channel = await _load_full(channel.id, db)
     return await _serialize_full(channel, db)
 
@@ -193,6 +195,7 @@ async def update_channel(
             db.add(ModelMapping(virtual_model=channel.virtual_model, provider_id=m_in.provider_id, native_model=m_in.native_model))
 
     await db.commit()
+    await cache_scan_delete(f"mm:{channel.virtual_model}:*")
     channel = await _load_full(channel.id, db)
     return await _serialize_full(channel, db)
 
@@ -211,5 +214,7 @@ async def delete_channel(channel_id: int, db: AsyncSession = Depends(get_db)) ->
     channel = await db.get(Channel, channel_id)
     if not channel:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "通道不存在")
+    virtual_model = channel.virtual_model
     await db.delete(channel)
     await db.commit()
+    await cache_scan_delete(f"mm:{virtual_model}:*")

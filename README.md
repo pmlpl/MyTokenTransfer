@@ -56,18 +56,18 @@ flowchart TD
     Backend["FastAPI backend :8082<br/>gateway / balancer / token_bucket<br/>accounting / scheduler"]
     MySQL[("MySQL 8.0 — 12 张表")]
     Upstream["上游 OpenAI 兼容端点<br/>多中转商 / 官方 API"]
-    Redis[("Redis 7 — 未接线")]
+    Redis[("Redis 7 — 配置热缓存")]
 
     Client -->|"/v1/* Bearer GATEWAY_TOKEN"| Nginx
     UI -->|"/api/* Bearer session-token"| Nginx
     Nginx --> Backend
     Backend -->|SQLAlchemy async| MySQL
     Backend -->|httpx 直连| Upstream
-    Backend -.->|未调用| Redis
+    Backend -->|ModelMapping / ModelPricing 缓存| Redis
 ```
 
-> [!IMPORTANT]
-> **关于 Redis**：`docker-compose.yml` 起了 `redis:7-alpine`，`pyproject.toml` 也声明了 `redis>=5.0`，但 `backend/app/` 下**没有任何 Redis 调用**（`config.py` 里也没有 `REDIS_URL` 字段）。当前所有限流 / 冷却状态都在**单进程内存**里（见 `relay/token_bucket.py` 与 `relay/balancer.py`）。因此**多副本部署会各自持有一份调度状态**，且重启会丢冷却态。这是已存在的技术债，不是 bug——如要横向扩容，需要先把这部分状态搬到 Redis。
+> [!NOTE]
+> **Redis 用途**：缓存 `ModelMapping`（虚拟模型→原生模型映射，每次转发读 2-6 次）和 `ModelPricing`（定价表，每次转发读 1 次）。写时失效（渠道/定价增删改时主动删 key），TTL 300 秒兜底。Redis 不可用时优雅降级，自动回退 DB 查询，不影响转发。
 
 ## 端口一览
 
@@ -223,7 +223,7 @@ npm run preview    # 预览构建产物
 | `SECRET_KEY` | ✅ | — | 会话签名密钥；`ENCRYPTION_KEY` 留空时也由它派生 Fernet key |
 | `GATEWAY_TOKEN` | ✅ | — | 客户端调 `/v1/*` 的 `Bearer` 令牌 |
 | `REDIS_PASSWORD` | ✅ | — | compose 里 Redis 的 `requirepass` |
-| `REDIS_URL` | ⬜ | `redis://redis:6379/0` | 传给后端容器，但**当前应用代码未读取**（见上文说明） |
+| `REDIS_URL` | ⬜ | `redis://redis:6379/0` | 后端配置热缓存连接地址；不可用时优雅降级 |
 | `ENCRYPTION_KEY` | ⬜ | 空 | 密钥静态加密的 Fernet key；留空则按 `SECRET_KEY` 派生 |
 | `SESSION_MAX_AGE` | ⬜ | `604800` | 登录态有效期（秒），默认 7 天 |
 | `WEB_PORT` | ⬜ | `8080` | 前端 nginx 对外端口 |

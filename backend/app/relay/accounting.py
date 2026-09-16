@@ -4,10 +4,12 @@
 """
 from __future__ import annotations
 
+import json
 from datetime import datetime, time, timedelta, timezone
 
 from sqlalchemy import select
 
+from app.core.cache import cache_get, cache_set
 from app.database import AsyncSessionLocal
 from app.models import CallLog, ModelPricing
 
@@ -60,20 +62,40 @@ async def write_call_log(
         cost = 0.0
         model_for_price = native_model or virtual_model
         if model_for_price and (pt or ct):
-            p = await s.scalar(
-                select(ModelPricing).where(ModelPricing.model_name == model_for_price)
-            )
-            if p is not None:
+            # Redis 缓存定价（纯配置数据，变更频率低）；
+            # "none" 哨兵表示该模型无定价行，避免重复空查 DB
+            cache_key = f"price:{model_for_price}"
+            cached_price = await cache_get(cache_key)
+            p_data: dict | None = None
+            if cached_price is not None:
+                if cached_price != "none":
+                    p_data = json.loads(cached_price)
+            else:
+                p = await s.scalar(
+                    select(ModelPricing).where(ModelPricing.model_name == model_for_price)
+                )
+                if p is not None:
+                    p_data = {
+                        "input_price": float(p.input_price),
+                        "cached_input_price": float(p.cached_input_price),
+                        "output_price": float(p.output_price),
+                        "off_peak_input_price": float(p.off_peak_input_price),
+                        "off_peak_output_price": float(p.off_peak_output_price),
+                    }
+                    await cache_set(cache_key, json.dumps(p_data))
+                else:
+                    await cache_set(cache_key, "none")
+            if p_data:
                 uncached = max(0, pt - cached)
                 # 高峰档用标准价，空闲档用折扣价；某档空闲价未填（0）则沿用高峰价
                 if _in_peak(_now()):
-                    in_price = float(p.input_price)
-                    out_price = float(p.output_price)
+                    in_price = p_data["input_price"]
+                    out_price = p_data["output_price"]
                 else:
-                    in_price = float(p.off_peak_input_price) or float(p.input_price)
-                    out_price = float(p.off_peak_output_price) or float(p.output_price)
+                    in_price = p_data["off_peak_input_price"] or p_data["input_price"]
+                    out_price = p_data["off_peak_output_price"] or p_data["output_price"]
                 cost = round(
-                    cached * float(p.cached_input_price) / 1_000_000
+                    cached * p_data["cached_input_price"] / 1_000_000
                     + uncached * in_price / 1_000_000
                     + ct * out_price / 1_000_000,
                     6,

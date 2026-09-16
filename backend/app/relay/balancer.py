@@ -78,13 +78,25 @@ def base_url_for(provider) -> str:
 
 
 async def resolve_native(virtual_model: str, provider_id: int, db: AsyncSession) -> str:
-    """虚拟模型 → 该供应商的 native 模型名（无映射则原样透传）。"""
+    """虚拟模型 → 该供应商的 native 模型名（无映射则原样透传）。
+
+    纯配置查询，每次转发调 2-6 次，Redis 缓存命中后直接返回。
+    空串哨兵表示"无映射，透传"，避免重复空查 DB。
+    """
+    from app.core.cache import cache_get, cache_set
+
+    cache_key = f"mm:{virtual_model}:{provider_id}"
+    cached = await cache_get(cache_key)
+    if cached is not None:
+        return cached if cached else virtual_model
     mm = await db.scalar(
         select(ModelMapping).where(
             ModelMapping.virtual_model == virtual_model, ModelMapping.provider_id == provider_id
         )
     )
-    return mm.native_model if mm else virtual_model
+    native = mm.native_model if mm else ""
+    await cache_set(cache_key, native)
+    return native if native else virtual_model
 
 
 def _head_prefix(messages, budget: int = _AFFINITY_PREFIX_BUDGET) -> str:

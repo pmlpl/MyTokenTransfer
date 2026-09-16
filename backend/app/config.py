@@ -23,5 +23,8 @@ class Settings(BaseSettings):
     # 前端地址（CORS）
     CORS_ORIGINS: list[str] = ["http://127.0.0.1:5173", "http://localhost:5173"]
 
+    # Redis（配置热缓存；不接线时优雅降级，回退 DB）
+    REDIS_URL: str = "redis://127.0.0.1:6379/0"
+
 
 settings = Settings()

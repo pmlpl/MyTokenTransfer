@@ -47,7 +47,7 @@
         │  12 张表      │            │ （多中转商 / 官方 API）     │
         └──────────────┘            └──────────────────────────┘
         ┌──────────────┐
-        │  Redis 7     │  ← compose 已起服务；应用代码当前未接线
+        │  Redis 7     │  ← 配置热缓存（ModelMapping / ModelPricing）
         └──────────────┘
 ```
 
@@ -209,8 +209,8 @@ frontend/src/
 
 | 约束 | 影响 | 出路 |
 | --- | --- | --- |
-| 状态全在单进程内存（冷却、令牌桶、`_tier_rate_limited_until`） | **不能多副本部署**；重启丢冷却态；每个副本各选各的 key | 把状态搬到 Redis（compose 里已经起了 Redis，但代码未接线） |
-| 无 Redis 接线 | `redis>=5.0` 声明未用；`config.py` 无 `REDIS_URL` 字段 | 同上 |
+| 冷却/令牌桶状态在单进程内存（`_tier_rate_limited_until`、`token_bucket._buckets`） | 多副本部署时各副本各有一份；重启丢冷却态 | 搬到 Redis（配置缓存已接线，冷却态待迁移） |
+| Redis 仅缓存配置 | ModelMapping / ModelPricing 已缓存；冷却态和令牌桶仍在内存 | 后续把 `_tier_rate_limited_until` / `token_bucket._buckets` 也搬到 Redis |
 | 未引入格式翻译层 | 只支持 OpenAI 兼容请求体；原生 Anthropic / Gemini 请求格式需客户端自行转换 | 需要时引入 LiteLLM 或自写转换 |
 | 缓存亲和基于消息前缀哈希 | 4096 字符预算；同一 system + 开头消息的会话会聚到同一 key（这是**特性**，用于共享前缀缓存） | 无需改；但要知道会话分布不均属预期 |
 | 无 LICENSE | 默认保留所有权利 | 补 `LICENSE` + `pyproject.toml` 的 `license` 字段 |

@@ -64,12 +64,30 @@ def _normalize_thinking(payload: dict) -> None:
             payload["thinking"] = "enabled"
 
 
-def _build_payload(body: dict, native_model: str, stream: bool) -> dict:
+# 支持 thinking/reasoning_effort 的供应商 base_url 关键词
+# 仅智谱原生 API（open.bigmodel.cn）支持，其他供应商一律剥离
+_THINKING_SUPPORTED_PROVIDERS = ("bigmodel.cn",)
+
+
+def _strip_unsupported_params(payload: dict, base_url: str) -> None:
+    """按供应商剥离不兼容的参数，避免上游 400 invalid arguments。
+
+    ZCode 更新后会发 thinking/reasoning_effort，但转售商（SenseNova 等）
+    的 OpenAI 兼容端点不接受这些非标参数，只对智谱原生 API 保留。
+    """
+    base_lower = (base_url or "").lower()
+    if not any(k in base_lower for k in _THINKING_SUPPORTED_PROVIDERS):
+        payload.pop("thinking", None)
+        payload.pop("reasoning_effort", None)
+
+
+def _build_payload(body: dict, native_model: str, stream: bool, base_url: str = "") -> dict:
     """构造发给上游的请求体：透传 OpenAI 参数，覆盖 model/stream。"""
     payload = dict(body)
     payload["model"] = native_model
     payload["stream"] = stream
-    # 修正 thinking/reasoning_effort 组合（zcode 等客户端易发矛盾参数）
+    # 先按供应商剥离不兼容参数，再修正剩余的 thinking 组合
+    _strip_unsupported_params(payload, base_url)
     _normalize_thinking(payload)
     # 流式时尽量带上 usage 统计
     if stream and "stream_options" not in payload:
@@ -247,7 +265,7 @@ async def route_chat_completions(
             await mark_key(key, KeyStatus.invalid, db, message="密文解密失败")
             continue
 
-        payload = _build_payload(body, native, stream)
+        payload = _build_payload(body, native, stream, base_url=base)
         t0 = time.time()
 
         if stream:
@@ -299,6 +317,27 @@ async def route_chat_completions(
                     if retry:
                         should_continue = True  # 换下一个 key（外层 for 继续）
                         break
+                    # 400 诊断：记录被拒的 payload keys，定位不兼容参数
+                    if response.status_code == 400:
+                        log.warning("upstream_400_invalid",
+                                    channel_id=channel.id, key_id=key.id,
+                                    provider_id=tier.provider_id, slug=tier.provider.slug,
+                                    virtual_model=virtual, native_model=native,
+                                    payload_keys=list(payload.keys()),
+                                    err_text=err_text[:300])
+                    await write_call_log(
+                        channel_id=channel.id,
+                        tier_order=tier.order,
+                        provider_id=tier.provider_id,
+                        key_id=key.id,
+                        virtual_model=virtual,
+                        native_model=native,
+                        usage=None,
+                        latency_ms=int((time.time() - t0) * 1000),
+                        status="error",
+                        error=msg,
+                        stream=True,
+                    )
                     return JSONResponse(
                         status_code=response.status_code,
                         content={"error": {"message": msg, "type": "upstream_error"}},
@@ -360,6 +399,14 @@ async def route_chat_completions(
                 await mark_key_model_status(db, key_id=key.id, provider_id=tier.provider_id, model_name=native, status=mark, message=msg)
             else:
                 await mark_key(key, mark, db, message=msg)
+            # 400 诊断：记录被拒的 payload keys，定位不兼容参数
+            if resp.status_code == 400:
+                log.warning("upstream_400_invalid",
+                            channel_id=channel.id, key_id=key.id,
+                            provider_id=tier.provider_id, slug=tier.provider.slug,
+                            virtual_model=virtual, native_model=native,
+                            payload_keys=list(payload.keys()),
+                            err_text=(resp.text or "")[:300])
             await write_call_log(
                 channel_id=channel.id,
                 tier_order=tier.order,

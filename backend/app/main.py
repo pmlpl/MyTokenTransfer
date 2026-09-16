@@ -8,6 +8,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api import alerts, auth, channels, dashboard, groups, keys, logs, pricing, providers, relay
 from app.api import settings as settings_api
 from app.config import settings
+from app.core.cache import close_redis, init_redis
 from app.core.scheduler import shutdown_scheduler, start_scheduler
 from app.core.structlog import configure_logging
 from app.relay.logging_middleware import RelayLoggingMiddleware
@@ -18,10 +19,12 @@ async def lifespan(app: FastAPI):
     configure_logging()  # 统一结构化日志（structlog + stdlib）
     from app.core.security import load_pwd_override
     load_pwd_override()  # 恢复 runtime 主密码 override（改密接口写入）
+    await init_redis(settings.REDIS_URL)  # 配置热缓存（不可用时降级，不影响转发）
     start_scheduler()  # 定时巡检：自动重测并恢复劣化密钥
     await _scan_undecryptable_keys()  # 启动时扫一遍，警告用旧 SECRET_KEY 加密的历史数据
     yield
     shutdown_scheduler()
+    await close_redis()
 
 
 async def _scan_undecryptable_keys() -> None:
