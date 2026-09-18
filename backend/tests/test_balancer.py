@@ -11,17 +11,17 @@ from datetime import timedelta
 from sqlalchemy import select
 
 from app.models import ApiKey, Channel, ChannelKey, ChannelTier, Provider
-from app.models.enums import KeyStrategy, KeyStatus
+from app.models.enums import KeyStatus, KeyStrategy
 from app.relay.balancer import (
-    last_resort_keys,
+    account_is_rate_limited,
     final_resort_keys,
+    last_resort_keys,
+    mark_account_rate_limited,
     mark_model_quota_limited,
-    mark_tier_rate_limited,
     model_quota_is_limited,
     now_utc,
     ordered_keys,
     routing_affinity,
-    tier_is_rate_limited,
 )
 
 
@@ -174,11 +174,12 @@ def test_model_quota_cooldown_is_per_model_pool():
     assert not model_quota_is_limited(12, "deepseek-v4-flash")  # 同模型换 key 不受牵连
 
 
-def test_tier_rate_limited_scopes_to_tier():
-    """tier TPM 冷却只影响被标记的层。"""
-    mark_tier_rate_limited(3)
-    assert tier_is_rate_limited(3)
-    assert not tier_is_rate_limited(4)
+def test_account_rate_limited_scopes_to_account():
+    """账号 TPM 冷却只影响同 (provider, account)，不牵连别账号/别 provider。"""
+    mark_account_rate_limited(3, "acct-A")
+    assert account_is_rate_limited(3, "acct-A")
+    assert not account_is_rate_limited(3, "acct-B")   # 同 provider 不同账号不受牵连
+    assert not account_is_rate_limited(4, "acct-A")   # 不同 provider 不受牵连
 
 
 async def test_rate_limited_future_cooldown_skipped(db_session):

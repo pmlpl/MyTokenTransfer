@@ -27,21 +27,24 @@ _AFFINITY_PREFIX_BUDGET = 4096
 # 限流冷却时长（秒）：命中 429 时把 key 标 rate_limited 并冷却这段时间
 _RATE_LIMIT_COOLDOWN = 60
 
-# Tier 级速率限制冷却：同一 provider 的密钥共享上游 TPM 池，一个限流全限流。
-# 标记整层冷却后，单次请求内跳过同层剩余密钥（避免无效重试），
-# 冷却期内新请求也不再碰这层（避免持续打爆已限流的池）。
-_tier_rate_limited_until: dict[int, datetime] = {}
+# 账号级速率限制冷却：同一 provider 下同账号的密钥共享上游 TPM 池（多数厂商
+# 按账号/组织限流），一个限流全限流。按 (provider_id, account_label) 标记——
+# 多账号部署时只牵连同账号的 key，不误伤别的账号。
+# account_label 为 None 的 key 视为同源（未标注账号时保守地共享冷却）。
+_account_rate_limited_until: dict[tuple[int, str | None], datetime] = {}
 
 
-def mark_tier_rate_limited(tier_id: int, cooldown: int = _RATE_LIMIT_COOLDOWN) -> None:
-    """标记整个 tier 处于速率限制冷却期（同池密钥共享 TPM，一个限流全限流）。"""
-    _tier_rate_limited_until[tier_id] = now_utc() + timedelta(seconds=cooldown)
-    log.warning("tier_rate_limited", tier_id=tier_id, cooldown_sec=cooldown)
+def mark_account_rate_limited(provider_id: int, account_label: str | None,
+                              cooldown: int = _RATE_LIMIT_COOLDOWN) -> None:
+    """标记某账号处于速率限制冷却期（同账号密钥共享上游 TPM，一个限流全限流）。"""
+    _account_rate_limited_until[(provider_id, account_label)] = now_utc() + timedelta(seconds=cooldown)
+    log.warning("account_rate_limited", provider_id=provider_id,
+                account_label=account_label, cooldown_sec=cooldown)
 
 
-def tier_is_rate_limited(tier_id: int) -> bool:
-    """检查 tier 是否处于速率限制冷却期。"""
-    until = _tier_rate_limited_until.get(tier_id)
+def account_is_rate_limited(provider_id: int, account_label: str | None) -> bool:
+    """检查该账号是否处于速率限制冷却期。"""
+    until = _account_rate_limited_until.get((provider_id, account_label))
     return until is not None and until > now_utc()
 
 

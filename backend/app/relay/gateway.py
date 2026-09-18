@@ -25,12 +25,12 @@ from app.relay.balancer import (
     mark_key,
     mark_key_model_status,
     mark_model_quota_limited,
-    mark_tier_rate_limited,
+    mark_account_rate_limited,
     model_quota_is_limited,
     ordered_keys,
     resolve_native,
     routing_affinity,
-    tier_is_rate_limited,
+    account_is_rate_limited,
 )
 from app.relay.errors import classify_error, is_model_pool_quota
 from app.relay.token_bucket import acquire_token
@@ -153,12 +153,12 @@ async def _build_attempts(
     virtual = channel.virtual_model
     attempts: list[tuple[ChannelTier, ApiKey]] = []
     for tier in tiers:
-        if tier_is_rate_limited(tier.id):
-            continue  # 同池短路：整层处于 TPM 冷却，跳过
         native = await resolve_native(virtual, tier.provider_id, db)
         keys = await ordered_keys(tier, channel.strategy, db, affinity, model_name=native)
         # 模型池冷却：该 key 上本模型的积分池刚报 429，跳过（其他模型不受影响）
         for k in keys[:max_retries]:
+            if account_is_rate_limited(k.provider_id, k.account_label):
+                continue  # 账号级短路：同账号密钥共享上游 TPM，一个限流全限流
             if model_quota_is_limited(k.id, virtual):
                 continue
             attempts.append((tier, k))
@@ -166,9 +166,9 @@ async def _build_attempts(
     # 额度窗口可能已滚动重置，试一次的代价是快速 429，收益是少一次 503；
     # 仅在前面的尝试可重试失败后才会轮到，正常路径零影响。
     for tier in tiers:
-        if tier_is_rate_limited(tier.id):
-            continue
         for k in await last_resort_keys(tier, db, max_retries):
+            if account_is_rate_limited(k.provider_id, k.account_label):
+                continue
             attempts.append((tier, k))
     # 全池模型池冷却兜底：小池子（如 deepseek 仅 2 把 key）在所有 key 的
     # (key,模型) 积分池同时进入 300 秒冷却时，上面产出空 attempts 会直接
@@ -176,15 +176,15 @@ async def _build_attempts(
     # 尝试，失败代价只是再吃一次快速 429，与 exhausted 兜底同理。
     if not attempts:
         for tier in tiers:
-            if tier_is_rate_limited(tier.id):
-                continue
             native = await resolve_native(virtual, tier.provider_id, db)
             keys = await ordered_keys(tier, channel.strategy, db, affinity, model_name=native)
             for k in keys[:max_retries]:
                 if model_quota_is_limited(k.id, virtual):
+                    if account_is_rate_limited(k.provider_id, k.account_label):
+                        continue  # 账号仍在 TPM 冷却：L3 仍守卫，留给 L4 赌
                     attempts.append((tier, k))
-    # 最终兜底：所有层都在 tier TPM 冷却时（高并发客户端瞬时打满共享
-    # TPM → 整层 60 秒冷却，各级兜底全被守卫跳过），无视冷却标记取层内
+    # 最终兜底：所有层都在账号 TPM 冷却时（高并发客户端瞬时打满共享
+    # TPM → 同账号 60 秒冷却，各级兜底全被守卫跳过），无视冷却标记取层内
     # 密钥试最后一轮；503 前的最后一搏，窗口滚动后这一把常能成功。
     if not attempts:
         for tier in tiers:
@@ -206,19 +206,19 @@ def _no_key_response() -> JSONResponse:
 def _cooldown_exemptions(
     attempts: list[tuple[ChannelTier, ApiKey]], virtual: str
 ) -> tuple[bool, bool]:
-    """兜底组合的守卫豁免判定，返回 (allow_quota_limited, allow_tier_limited)。
+    """兜底组合的守卫豁免判定，返回 (allow_quota_limited, allow_account_limited)。
 
     attempts 全部带着模型池冷却标记时（兜底场景）不跳过，否则兜底白加；
-    存在无冷却组合时仍跳过冷却中的，避免浪费重试次数。tier TPM 冷却同理：
-    最终兜底拿到的组合全部处于整层冷却时豁免守卫。
+    存在无冷却组合时仍跳过冷却中的，避免浪费重试次数。账号 TPM 冷却同理：
+    最终兜底拿到的组合全部处于账号冷却时豁免守卫。
     """
     allow_quota_limited = bool(attempts) and all(
         model_quota_is_limited(k.id, virtual) for _, k in attempts
     )
-    allow_tier_limited = bool(attempts) and all(
-        tier_is_rate_limited(t.id) for t, _ in attempts
+    allow_account_limited = bool(attempts) and all(
+        account_is_rate_limited(k.provider_id, k.account_label) for _, k in attempts
     )
-    return allow_quota_limited, allow_tier_limited
+    return allow_quota_limited, allow_account_limited
 
 
 async def _revive_if_exhausted(key: ApiKey, db: AsyncSession) -> None:
@@ -244,9 +244,9 @@ async def route_chat_completions(
         return _no_key_response()
 
     last_error = "无可用上游"
-    allow_quota_limited, allow_tier_limited = _cooldown_exemptions(attempts, virtual)
+    allow_quota_limited, allow_account_limited = _cooldown_exemptions(attempts, virtual)
     for tier, key in attempts:
-        if tier_is_rate_limited(tier.id) and not allow_tier_limited:
+        if account_is_rate_limited(key.provider_id, key.account_label) and not allow_account_limited:
             continue  # 同池短路：该层已在本次请求内被标记 TPM 冷却
         if model_quota_is_limited(key.id, virtual) and not allow_quota_limited:
             continue  # 模型池冷却：该 key 上本模型的积分池刚报 429
@@ -302,7 +302,7 @@ async def route_chat_completions(
                     retry, mark, msg = classify_error(response.status_code, err_text)
                     _is_model_quota = is_model_pool_quota(err_text) or "entitlement" in (err_text or "").lower()
                     if mark == KeyStatus.rate_limited:
-                        mark_tier_rate_limited(tier.id)  # 同池短路：整层 TPM 冷却
+                        mark_account_rate_limited(key.provider_id, key.account_label)  # 账号短路：同账号 TPM 冷却
                         await mark_key_model_status(db, key_id=key.id, provider_id=tier.provider_id, model_name=native, status=mark, message=msg)
                     elif mark == KeyStatus.exhausted and _is_model_quota:
                         # 模型池级额度耗尽（含 SenseNova token plan entitlement）：只标记 (key, 模型)，不把整把 key 标死
@@ -388,7 +388,7 @@ async def route_chat_completions(
             retry, mark, msg = classify_error(resp.status_code, resp.text)
             _is_model_quota = is_model_pool_quota(resp.text) or "entitlement" in (resp.text or "").lower()
             if mark == KeyStatus.rate_limited:
-                mark_tier_rate_limited(tier.id)  # 同池短路：整层 TPM 冷却
+                mark_account_rate_limited(key.provider_id, key.account_label)  # 账号短路：同账号 TPM 冷却
                 await mark_key_model_status(db, key_id=key.id, provider_id=tier.provider_id, model_name=native, status=mark, message=msg)
             elif mark == KeyStatus.exhausted and _is_model_quota:
                 # 模型池级额度耗尽（含 SenseNova token plan entitlement）：只标记 (key, 模型)，不把整把 key 标死
@@ -503,10 +503,10 @@ async def route_embeddings(channel: Channel, body: dict, db: AsyncSession) -> JS
 
     last_error = "无可用上游"
     # 同 chat：全冷却时豁免跳过，兜底组合才有机会执行
-    allow_quota_limited, allow_tier_limited = _cooldown_exemptions(attempts, virtual)
+    allow_quota_limited, allow_account_limited = _cooldown_exemptions(attempts, virtual)
     for tier, key in attempts:
-        if tier_is_rate_limited(tier.id) and not allow_tier_limited:
-            continue  # 同池短路：该层已被标记 TPM 冷却
+        if account_is_rate_limited(key.provider_id, key.account_label) and not allow_account_limited:
+            continue  # 账号短路：该账号已被标记 TPM 冷却
         if model_quota_is_limited(key.id, virtual) and not allow_quota_limited:
             continue  # 模型池冷却：该 key 上本模型的积分池刚报 429
         native = await resolve_native(virtual, tier.provider_id, db)
@@ -555,7 +555,7 @@ async def route_embeddings(channel: Channel, body: dict, db: AsyncSession) -> JS
         retry, mark, msg = classify_error(resp.status_code, resp.text)
         _is_model_quota = is_model_pool_quota(resp.text) or "entitlement" in (resp.text or "").lower()
         if mark == KeyStatus.rate_limited:
-            mark_tier_rate_limited(tier.id)  # 同池短路：整层 TPM 冷却
+            mark_account_rate_limited(key.provider_id, key.account_label)  # 账号短路：同账号 TPM 冷却
             await mark_key_model_status(db, key_id=key.id, provider_id=tier.provider_id, model_name=native, status=mark, message=msg)
         elif mark == KeyStatus.exhausted and _is_model_quota:
             # 模型池级额度耗尽（含 SenseNova token plan entitlement）：只标记 (key, 模型)，不把整把 key 标死
@@ -681,9 +681,9 @@ async def route_image_generations(
         return _no_key_response()
 
     last_error = "无可用上游"
-    allow_quota_limited, allow_tier_limited = _cooldown_exemptions(attempts, virtual)
+    allow_quota_limited, allow_account_limited = _cooldown_exemptions(attempts, virtual)
     for tier, key in attempts:
-        if tier_is_rate_limited(tier.id) and not allow_tier_limited:
+        if account_is_rate_limited(key.provider_id, key.account_label) and not allow_account_limited:
             continue
         if model_quota_is_limited(key.id, virtual) and not allow_quota_limited:
             continue
@@ -737,7 +737,7 @@ async def route_image_generations(
         retry, mark, msg = classify_error(resp.status_code, resp.text)
         _is_model_quota = is_model_pool_quota(resp.text) or "entitlement" in (resp.text or "").lower()
         if mark == KeyStatus.rate_limited:
-            mark_tier_rate_limited(tier.id)
+            mark_account_rate_limited(key.provider_id, key.account_label)
             await mark_key_model_status(db, key_id=key.id, provider_id=tier.provider_id, model_name=native, status=mark, message=msg)
         elif mark == KeyStatus.exhausted and _is_model_quota:
             mark_model_quota_limited(key.id, virtual)

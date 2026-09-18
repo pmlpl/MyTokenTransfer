@@ -15,17 +15,17 @@ import app.models  # noqa: F401,E402  确保所有模型注册到 Base.metadata
 
 @pytest.fixture(autouse=True)
 def _clear_relay_cooldowns():
-    """清空中继层的进程内冷却标记（tier TPM / 模型池额度）。
+    """清空中继层的进程内冷却标记（账号 TPM / 模型池额度）。
 
     这两个标记挂在 balancer 模块级 dict 上、生命周期跨用例，不清理会串扰：
     A 用例标的冷却会让 B 用例的调度悄悄走兜底分支。
     """
     from app.relay import balancer
 
-    balancer._tier_rate_limited_until.clear()
+    balancer._account_rate_limited_until.clear()
     balancer._model_quota_limited_until.clear()
     yield
-    balancer._tier_rate_limited_until.clear()
+    balancer._account_rate_limited_until.clear()
     balancer._model_quota_limited_until.clear()
 
 

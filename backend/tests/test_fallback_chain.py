@@ -15,10 +15,10 @@ from datetime import timedelta
 from types import SimpleNamespace
 
 from app.models import ApiKey, Channel, ChannelKey, ChannelTier, Provider
-from app.models.enums import KeyStrategy, KeyStatus
+from app.models.enums import KeyStatus, KeyStrategy
 from app.relay.balancer import (
+    mark_account_rate_limited,
     mark_model_quota_limited,
-    mark_tier_rate_limited,
     now_utc,
 )
 from app.relay.gateway import _build_attempts, _cooldown_exemptions
@@ -215,7 +215,7 @@ async def test_tier_cooldown_triggers_final_resort(db_session):
     keys[0].last_tested_at = now_utc() - timedelta(hours=1)
     keys[2].last_tested_at = now_utc() - timedelta(hours=2)
     await db.commit()
-    mark_tier_rate_limited(tier.id)
+    mark_account_rate_limited(p.id, None)
 
     attempts = await _build_attempts(ch, db, 0)
     assert [(t.id, k.id) for t, k in attempts] == [
@@ -255,27 +255,30 @@ def test_cooldown_exemptions_all_cooling():
     """兜底场景：attempts 全部处于冷却 → 两个守卫都豁免，组合才有机会执行。"""
     mark_model_quota_limited(1, VIRTUAL)
     mark_model_quota_limited(2, VIRTUAL)
-    mark_tier_rate_limited(9)
+    mark_account_rate_limited(9, "acct")
     t = SimpleNamespace(id=9)
-    attempts = [(t, SimpleNamespace(id=1)), (t, SimpleNamespace(id=2))]
+    attempts = [
+        (t, SimpleNamespace(id=1, provider_id=9, account_label="acct")),
+        (t, SimpleNamespace(id=2, provider_id=9, account_label="acct")),
+    ]
 
-    allow_quota, allow_tier = _cooldown_exemptions(attempts, VIRTUAL)
+    allow_quota, allow_account = _cooldown_exemptions(attempts, VIRTUAL)
     assert allow_quota
-    assert allow_tier
+    assert allow_account
 
 
 def test_cooldown_exemptions_partial_not_exempt():
     """存在任一干净组合即不豁免：冷却中的照旧跳过，别浪费重试次数。"""
     mark_model_quota_limited(1, VIRTUAL)
-    mark_tier_rate_limited(9)
+    mark_account_rate_limited(9, "acct")
     attempts = [
-        (SimpleNamespace(id=9), SimpleNamespace(id=1)),    # 双冷却
-        (SimpleNamespace(id=8), SimpleNamespace(id=2)),    # 干净组合
+        (SimpleNamespace(id=9), SimpleNamespace(id=1, provider_id=9, account_label="acct")),    # 双冷却
+        (SimpleNamespace(id=8), SimpleNamespace(id=2, provider_id=8, account_label="other")),  # 干净组合
     ]
 
-    allow_quota, allow_tier = _cooldown_exemptions(attempts, VIRTUAL)
+    allow_quota, allow_account = _cooldown_exemptions(attempts, VIRTUAL)
     assert not allow_quota
-    assert not allow_tier
+    assert not allow_account
 
 
 def test_cooldown_exemptions_empty_attempts():
