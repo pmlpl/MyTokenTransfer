@@ -71,5 +71,12 @@ async def delete_provider(provider_id: int, db: AsyncSession = Depends(get_db)) 
     provider = await db.get(Provider, provider_id)
     if not provider:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "供应商不存在")
-    await db.delete(provider)
-    await db.commit()
+    try:
+        await db.delete(provider)
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "该供应商下仍有密钥或通道层引用，无法删除；请先移除相关 key 与 tier",
+        )
