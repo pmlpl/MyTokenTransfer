@@ -200,9 +200,12 @@ async def ordered_keys(
         if model_name:
             kms = await get_key_model_status(db, ak.id, model_name)
             if kms is not None:
-                if kms.status != KeyStatus.active:
-                    continue
-                if kms.rate_limited_until and kms.rate_limited_until > now_utc():
+                if kms.status == KeyStatus.rate_limited:
+                    # 冷却已到期但巡检尚未复测回 active：当可用
+                    # 与密钥级 fast-path 同理，省一个巡检周期（10 分钟）的付费兜底
+                    if kms.rate_limited_until and kms.rate_limited_until > now_utc():
+                        continue
+                elif kms.status != KeyStatus.active:
                     continue
         pairs.append((ck, ak))
 
