@@ -117,9 +117,11 @@ def _is_gateway_read_body_error(err_text: str) -> bool:
 _NETWORK_RETRY = 3
 _NETWORK_BACKOFF = 1.0  # 秒
 
-# 账号限流冷却"刚生效"阈值（秒）：冷却剩余 >此值 = 刚标记 <10s，
-# 此时 final_resort 注定 429/超时，跳过直接返回 429 避免 30-40s 慢 502。
-_FRESH_COOLDOWN_SEC = 50
+# 账号限流冷却短路阈值（秒）：所有候选 key 冷却剩余 >此值时直接返回 429，
+# 跳过 final_resort。设 0 = 只要全在冷却中就短路——final_resort 对 DeepSeek
+# 等持续限流的模型从未成功，只徒增 doomed 请求并重置冷却计时器导致死循环。
+# 冷却过期后 key 自然回到 attempts，不需要 final_resort 赌窗口。
+_FRESH_COOLDOWN_SEC = 0
 
 
 async def _send_with_retry(
@@ -294,10 +296,9 @@ async def route_chat_completions(
             any_tpm_headroom = True
             break
 
-    # 全部账号刚被限流（冷却剩余 >50s = 60s 冷却的刚标记 <10s）→ 直接返回
-    # 429 + Retry-After，不走 final_resort 兜底。final_resort 会对每把冷却中的
-    # key 串行发请求（含 3 次 network_retry × ConnectTimeout 10s），把 502 延迟
-    # 拉到 30-40s → dsh 超时杀任务。冷却接近过期（<50s）时仍走兜底赌窗口滚动。
+    # 全部账号在限流冷却中 → 直接返回 429 + Retry-After，不走 final_resort。
+    # final_resort 会对每把冷却中的 key 串行发 doomed 请求 → 429 又重置冷却
+    # 计时器 → 冷却永远过不去 → 死循环。设阈值 0 = 只要全在冷却就短路。
     if attempts and all(
         account_rate_limited_remaining(k.provider_id, k.account_label) > _FRESH_COOLDOWN_SEC
         for _, k in attempts
