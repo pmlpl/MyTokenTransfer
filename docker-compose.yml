@@ -59,6 +59,12 @@ services:
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       REDIS_PASSWORD: ${REDIS_PASSWORD:-}
 
+      # —— 令牌桶限流：DeepSeek-Flash 快生成 → TPM/RPM 双限流，默认值偏高 ——
+      # RPM：SenseNova 免费层未公布，20 太高触发 EndpointRPMExceeded，降到 5
+      # TPM：30000 对 GLM-5.2 够用，DeepSeek-Flash 降到 10000（原生模型名 deepseek-flash）
+      MTT_TOKEN_BUCKET_MODEL_RPM: ${MTT_TOKEN_BUCKET_MODEL_RPM:-deepseek-flash:5}
+      MTT_TOKEN_BUCKET_MODEL_TPM: ${MTT_TOKEN_BUCKET_MODEL_TPM:-deepseek-flash:10000}
+
       # —— CORS：同源反代只需允许前端 http 地址；若要额外放行直连 8082 端口可自行追加 ——
       CORS_ORIGINS: >-
         [
