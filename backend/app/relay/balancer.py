@@ -48,6 +48,14 @@ def account_is_rate_limited(provider_id: int, account_label: str | None) -> bool
     return until is not None and until > now_utc()
 
 
+def account_rate_limited_remaining(provider_id: int, account_label: str | None) -> float:
+    """返回账号限流冷却剩余秒数（0 表示已过期或未限流）。"""
+    until = _account_rate_limited_until.get((provider_id, account_label))
+    if until is None:
+        return 0.0
+    return max(0.0, (until - now_utc()).total_seconds())
+
+
 # 模型池级额度冷却：转售商按 key×模型 划分积分池，某模型的池子用尽（429
 # "Allocated quota exceeded"）与密钥本身无关——同一把 key 上其他模型仍可用。
 # 只对 (key, virtual_model) 组合短冷却，不把整把 key 标 exhausted，

@@ -20,6 +20,7 @@ from app.models import ApiKey, Channel, ChannelTier, KeyStatus
 from app.relay.accounting import write_call_log
 from app.relay.balancer import (
     account_is_rate_limited,
+    account_rate_limited_remaining,
     base_url_for,
     final_resort_keys,
     last_resort_keys,
@@ -115,6 +116,10 @@ def _is_gateway_read_body_error(err_text: str) -> bool:
 # 仅重试连接/发送阶段的异常（流未打开、请求未发出），HTTP 状态码一律交给 classify_error。
 _NETWORK_RETRY = 3
 _NETWORK_BACKOFF = 1.0  # 秒
+
+# 账号限流冷却"刚生效"阈值（秒）：冷却剩余 >此值 = 刚标记 <10s，
+# 此时 final_resort 注定 429/超时，跳过直接返回 429 避免 30-40s 慢 502。
+_FRESH_COOLDOWN_SEC = 50
 
 
 async def _send_with_retry(
@@ -288,6 +293,21 @@ async def route_chat_completions(
         if tpm_available(key.provider_id, key.account_label, native_check) >= est_tokens:
             any_tpm_headroom = True
             break
+
+    # 全部账号刚被限流（冷却剩余 >50s = 60s 冷却的刚标记 <10s）→ 直接返回
+    # 429 + Retry-After，不走 final_resort 兜底。final_resort 会对每把冷却中的
+    # key 串行发请求（含 3 次 network_retry × ConnectTimeout 10s），把 502 延迟
+    # 拉到 30-40s → dsh 超时杀任务。冷却接近过期（<50s）时仍走兜底赌窗口滚动。
+    if attempts and all(
+        account_rate_limited_remaining(k.provider_id, k.account_label) > _FRESH_COOLDOWN_SEC
+        for _, k in attempts
+    ):
+        log.info("all_fresh_cooldown_429", channel_id=channel.id, virtual_model=virtual)
+        return JSONResponse(
+            status_code=429,
+            headers={"Retry-After": "60"},
+            content={"error": {"message": "所有上游账号处于限流冷却期", "type": "rate_limited"}},
+        )
 
     for tier, key in attempts:
         if account_is_rate_limited(key.provider_id, key.account_label) and not allow_account_limited:
