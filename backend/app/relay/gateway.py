@@ -19,21 +19,21 @@ from app.core.security import decrypt_value
 from app.models import ApiKey, Channel, ChannelTier, KeyStatus
 from app.relay.accounting import write_call_log
 from app.relay.balancer import (
+    account_is_rate_limited,
     base_url_for,
     final_resort_keys,
     last_resort_keys,
+    mark_account_rate_limited,
     mark_key,
     mark_key_model_status,
     mark_model_quota_limited,
-    mark_account_rate_limited,
     model_quota_is_limited,
     ordered_keys,
     resolve_native,
     routing_affinity,
-    account_is_rate_limited,
 )
 from app.relay.errors import classify_error, is_model_pool_quota
-from app.relay.token_bucket import acquire_token
+from app.relay.token_bucket import acquire_token, tpm_available, tpm_correct
 from app.services.health_check import _join
 
 log = structlog.get_logger("relay")
@@ -230,11 +230,41 @@ async def _revive_if_exhausted(key: ApiKey, db: AsyncSession) -> None:
         await mark_key(key, KeyStatus.active, db, message="真实请求成功，自动恢复")
 
 
+# TPM 控速的输出 token 预估默认值：客户端未设 max_tokens 时取此值。
+# 保守取 4096（多数 agent 步骤的典型输出上限）。
+_DEFAULT_OUTPUT_ESTIMATE = 4096
+
+
+def _estimate_tokens(body: dict) -> int:
+    """粗估一次请求的总 token 数（prompt + output），用于 TPM 事前控速。
+
+    保守高估优于低估——多扣的会在响应返回后按实际 usage 修正。
+    prompt: 约 3 字符/token（对中英文混合的保守估计）；
+    output: 用 max_tokens（客户端设的上限），否则取默认预估。
+    """
+    prompt_chars = 0
+    for m in body.get("messages") or []:
+        if not isinstance(m, dict):
+            continue
+        content = m.get("content", "")
+        if isinstance(content, str):
+            prompt_chars += len(content)
+        elif isinstance(content, list):
+            for seg in content:
+                if isinstance(seg, dict):
+                    prompt_chars += len(str(seg.get("text", "")))
+    prompt_est = max(1, prompt_chars // 3)
+    max_output = body.get("max_tokens") or body.get("max_completion_tokens")
+    output_est = int(max_output) if max_output else _DEFAULT_OUTPUT_ESTIMATE
+    return prompt_est + output_est
+
+
 async def route_chat_completions(
     channel: Channel, body: dict, db: AsyncSession
 ) -> JSONResponse | StreamingResponse:
     virtual = channel.virtual_model
     stream = bool(body.get("stream"))
+    est_tokens = _estimate_tokens(body)  # TPM 事前控速：预估本次请求 token 消耗
     # 缓存亲和：由虚拟模型 + 消息稳定前缀派生路由哈希，同一会话固定同一 key
     affinity = routing_affinity(virtual, body)
 
@@ -245,15 +275,34 @@ async def route_chat_completions(
 
     last_error = "无可用上游"
     allow_quota_limited, allow_account_limited = _cooldown_exemptions(attempts, virtual)
+
+    # 预检 TPM：是否有任何 key 的账号 TPM 桶有余量。
+    # 有余量时跳过桶空的 key（换有余量的账号）；全空时顾问放行（不硬阻）。
+    any_tpm_headroom = False
+    for tier, key in attempts:
+        if account_is_rate_limited(key.provider_id, key.account_label) and not allow_account_limited:
+            continue
+        if model_quota_is_limited(key.id, virtual) and not allow_quota_limited:
+            continue
+        native_check = await resolve_native(virtual, tier.provider_id, db)
+        if tpm_available(key.provider_id, key.account_label, native_check) >= est_tokens:
+            any_tpm_headroom = True
+            break
+
     for tier, key in attempts:
         if account_is_rate_limited(key.provider_id, key.account_label) and not allow_account_limited:
             continue  # 同池短路：该层已在本次请求内被标记 TPM 冷却
         if model_quota_is_limited(key.id, virtual) and not allow_quota_limited:
             continue  # 模型池冷却：该 key 上本模型的积分池刚报 429
         native = await resolve_native(virtual, tier.provider_id, db)
-        # 令牌桶事前控速：该 key+模型无令牌时跳过，换下一把 key（多密钥池自动负载）
-        if not acquire_token(key.id, native):
-            continue
+        # 令牌桶事前控速：RPM（按 key）+ TPM（按账号）。
+        # TPM 有余量的 key 优先；全空时顾问放行（tpm_consumed=False，事后按实际补扣）。
+        acquired = acquire_token(
+            key.id, native, est_tokens=est_tokens,
+            provider_id=key.provider_id, account_label=key.account_label,
+        )
+        if not acquired and any_tpm_headroom:
+            continue  # 跳过桶空的 key，换有余量的账号
         base = base_url_for(tier.provider)
         if not base:
             last_error = f"供应商 {tier.provider.slug} 缺少 base_url"
@@ -356,6 +405,9 @@ async def route_chat_completions(
                 "virtual_model": virtual,
                 "native_model": native,
                 "t0": t0,
+                "account_label": key.account_label,
+                "est_tokens": est_tokens,
+                "tpm_consumed": acquired,  # True=已预扣 TPM; False=顾问放行未预扣
             }
             return StreamingResponse(
                 _stream_passthrough(client, response, meta), media_type="text/event-stream"
@@ -371,6 +423,12 @@ async def route_chat_completions(
             if resp.status_code == 200:
                 data = resp.json()
                 await _revive_if_exhausted(key, db)
+                # TPM 事后修正：按实际 usage 调整账号 TPM 桶
+                _usage = data.get("usage")
+                if _usage:
+                    _actual = (_usage.get("prompt_tokens", 0) or 0) + (_usage.get("completion_tokens", 0) or 0)
+                    tpm_correct(key.provider_id, key.account_label, native,
+                                est_tokens if acquired else 0, _actual)
                 await write_call_log(
                     channel_id=channel.id,
                     tier_order=tier.order,
@@ -469,6 +527,15 @@ async def _stream_passthrough(client: httpx.AsyncClient, response: httpx.Respons
             pass
         await client.aclose()
         latency_ms = int((time.time() - meta["t0"]) * 1000)
+        # TPM 事后修正：按实际 usage 调整账号 TPM 桶
+        if usage:
+            actual = (usage.get("prompt_tokens", 0) or 0) + (usage.get("completion_tokens", 0) or 0)
+            tpm_correct(
+                meta["provider_id"], meta.get("account_label"),
+                meta["native_model"],
+                meta.get("est_tokens", 0) if meta.get("tpm_consumed") else 0,
+                actual,
+            )
         # 用独立任务写日志：即使客户端中途断开导致生成器被取消，日志也能落库
         asyncio.create_task(
             write_call_log(
