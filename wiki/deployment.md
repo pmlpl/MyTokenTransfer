@@ -240,9 +240,12 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 
 | 变量 | 默认 | 说明 | 代码 |
 | --- | :---: | --- | --- |
-| `MTT_TOKEN_BUCKET_RPM` | `20` | 每把 key 每分钟请求上限 | `relay/token_bucket.py` |
-| `MTT_TOKEN_BUCKET_BURST` | `10` | 突发容量 | 同上 |
-| `MTT_TOKEN_BUCKET_MODEL_RPM` | 空 | 按原生模型名覆盖 RPM，格式 `glm-5.2:10,deepseek-v4-flash:15` | 同上 |
+| `MTT_TOKEN_BUCKET_RPM` | `20` | 每把 key 每分钟请求上限（RPM 桶） | `relay/token_bucket.py` |
+| `MTT_TOKEN_BUCKET_BURST` | `10` | RPM 突发容量 | 同上 |
+| `MTT_TOKEN_BUCKET_MODEL_RPM` | 空 | 按原生模型名覆盖 RPM，格式 `deepseek-flash:5` | 同上 |
+| `MTT_TOKEN_BUCKET_TPM` | `30000` | 每账号每分钟 token 上限（TPM 桶，0=关闭） | 同上 |
+| `MTT_TOKEN_BUCKET_TPM_BURST_RATIO` | `0.5` | TPM 突发容量比例（burst = TPM × ratio） | 同上 |
+| `MTT_TOKEN_BUCKET_MODEL_TPM` | 空 | 按原生模型名覆盖 TPM，格式 `deepseek-flash:10000` | 同上 |
 
 > 想调令牌桶就得在 compose 的 `backend.environment` 里加这几项（或本地 shell 里 `export`），因为 compose 默认不注入它们。
 

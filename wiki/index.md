@@ -20,7 +20,7 @@
 
 | 文档 | 内容 | 关键代码 |
 | --- | --- | --- |
-| [scheduling.md](scheduling.md) | Tier 调度、三种策略、**四级兜底**、冷却参数、令牌桶事前限速 | `app/relay/balancer.py`、`app/relay/token_bucket.py` |
+| [scheduling.md](scheduling.md) | Tier 调度、三种策略、**五级兜底**、冷却参数、双层令牌桶（RPM+TPM） | `app/relay/balancer.py`、`app/relay/token_bucket.py`、`app/relay/gateway.py` |
 | [billing-and-usage.md](billing-and-usage.md) | 计费维度、峰谷双档窗口、用量聚合链路、时间口径 | `app/relay/accounting.py`、`app/services/usage.py` |
 | [deployment.md](deployment.md) | 三种部署方式、环境变量全表、端口口径、备份与迁移 | `docker-compose*.yml`、`deploy.ps1`、`dev.ps1` |
 
@@ -49,7 +49,7 @@ README.md        项目是什么 + 怎么跑起来
    │
    ├─ 入门 ──────── architecture.md      模块与数据流
    │
-   ├─ 核心机制 ──── scheduling.md        调度 / 四级兜底 ★ 最核心
+   ├─ 核心机制 ──── scheduling.md        调度 / 五级兜底 ★ 最核心
    │                billing-and-usage.md 计费 / 用量
    │                deployment.md        部署 / 配置
    │
@@ -70,20 +70,21 @@ README.md        项目是什么 + 怎么跑起来
 客户端 /v1/chat/completions
   → relay.py 查通道（virtual_model → Channel）
   → gateway.route_chat_completions 编排 (tier, key) 尝试序列
-  → token_bucket 事前检查速率（无令牌换 key）
+  → token_bucket 事前检查速率（RPM 按 key 扣 1 + TPM 按预估 token 数扣，无令牌换 key）
   → balancer 生成候选队列 + 处理失败标记
   → httpx 直连上游 OpenAI 兼容端点
   → accounting 写 CallLog + 概算成本
   → 返回（stream=true 时 SSE 透传）
 ```
 
-**② 四级兜底**（细节 → [scheduling.md](scheduling.md)）
+**② 五级兜底**（细节 → [scheduling.md](scheduling.md)）
 
 ```
 T0 正常 active key
  → 全池 exhausted：赌额度窗口已滚动恢复（复测周期 10 min）
  → 模型池冷却：(key, 模型) 组合只冷却 300 s，不标死整把 key
- → tier TPM 冷却：整层 60 s，全层冷却时无视冷却试最后一轮
+ → 账号 TPM 冷却：同账号 60 s，全池冷却时无视冷却取层内密钥
+ → 冷却短路：全部在冷却中 → 直接 429 + Retry-After: 60（不走 for 循环）
  → 仍失败 → 503；网络瞬时故障原地重试 3 次
 ```
 

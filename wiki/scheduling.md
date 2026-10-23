@@ -57,6 +57,10 @@ virtual_model = "deepseek-v4-flash"        ← 客户端填这个
    for tier in tiers:                                   ← 注意：不再判 tier_is_rate_limited
        for k in final_resort_keys(tier, max_retries):
            attempts.append((tier, k))
+
+⑤ 冷却短路（在尝试循环之前）
+   if all(account_rate_limited_remaining(k) > 0):       ← 全部在冷却中
+       return 429 + Retry-After: 60                      ← 直接返回，不走 for 循环
 ```
 
 四层都空 → 直接返回 `503`：
@@ -73,6 +77,8 @@ virtual_model = "deepseek-v4-flash"        ← 客户端填这个
 - 不试的代价：直接 503，客户端看到失败。
 
 所以在「别无选择」时，宁可赌一把。**这三层只在前面无人可试时才启用，正常路径零影响** —— 这是这套设计的核心取舍。
+
+> ⚠️ **⑤ 冷却短路**（2026-09-24 新增）：④ 构建出来后，如果所有候选 key 都在账号限流冷却中（`account_rate_limited_remaining > 0`），直接返回 429 + `Retry-After: 60`，**不走 for 循环**。此前 ④ 会对每把冷却中的 key 串行发 doomed 请求 → 429 又重置冷却 → 冷却永远过不去 → 死循环。实测 DeepSeek-Flash 持续限流时 final_resort 从未成功，短路后响应从 30-40s 慢 502 降到亚秒级 429。
 
 ### 守卫豁免（`_cooldown_exemptions`）
 
@@ -95,7 +101,7 @@ allow_tier_limited  = attempts 非空 and 所有 attempt 都处于 tier TPM 冷�
 | 1 | `tier_is_rate_limited(tier.id)` 且未豁免 | 跳过 |
 | 2 | `model_quota_is_limited(key.id, virtual)` 且未豁免 | 跳过 |
 | 3 | `resolve_native()` 取原生模型名 | — |
-| 4 | **`acquire_token(key.id, native)` 令牌桶** | 跳过（换下一把 key，**不硬失败**） |
+| 4 | **`acquire_token(key.id, native, est_tokens, provider_id, account_label)` 令牌桶** | 跳过（换下一把 key，**不硬失败**）；RPM 桶按 key 扣 1、TPM 桶按预估 token 数扣（全空时顾问放行） |
 | 5 | `base_url_for(tier.provider)` 非空 | 记 `供应商 X 缺少 base_url`，跳过 |
 | 6 | `decrypt_value(key.key_value)` 解密钥 | **把 key 标 `invalid`**（"密文解密失败"），跳过 |
 | 7 | 发请求（`_send_with_retry`） | 见下 |
@@ -146,7 +152,7 @@ _GATEWAY_READ_BODY_ERRORS = ("read body failed", "read_body_failed", "reading re
 
 ```python
 if mark == rate_limited:
-    mark_tier_rate_limited(tier.id)                       # 整层 60 s 冷却（同池共享 TPM）
+    mark_account_rate_limited(key.provider_id, account_label)  # 账号级 60 s 冷却（同账号共享 TPM）
     mark_key_model_status(..., model_name=native)         # 同时记 (key, 模型) 状态
 
 elif mark == exhausted and is_model_pool_quota(err_text):
@@ -162,7 +168,7 @@ else:
 
 | 上游情况 | 标记范围 | 理由 |
 | --- | --- | --- |
-| 429 限流 | **整个 tier** + (key,模型) | 同一 provider 的 key 共享上游 TPM 池，一个限流全限流 |
+| 429 限流 | **账号级** + (key,模型) | 同账号的 key 共享上游 TPM 池，一个限流全限流；按 `(provider_id, account_label)` 标记 |
 | 429 且是模型池级额度耗尽 | **(key, 模型)** | 只是该模型的积分池空了，同 key 其它模型还能用 |
 | 401/403 且 `no access to model` | **(key, 模型)** | 密钥本身有效，只是该模型无权限 |
 | 401/403 其它 | 整把 key → `invalid` | 密钥真失效 |
@@ -171,7 +177,7 @@ else:
 
 `is_model_pool_quota()` 还会识别 `entitlement` 关键词（如 SenseNova 的 token plan）。
 
-## 5. 四级兜底总表（就是 README 里那张，带参数）
+## 5. 五级兜底总表（就是 README 里那张，带参数）
 
 | 级别 | 触发条件 | 做什么 | 关键参数 |
 | :---: | --- | --- | --- |
@@ -179,6 +185,15 @@ else:
 | **2** | 全池 `exhausted` | 追加**最久未测**的 `exhausted` 密钥，赌额度窗口已滚动恢复 | `exhausted` 复测周期 **10 分钟** |
 | **3** | 所有 key 的 `(key, 模型)` 积分池同时冷却 | 追加冷却中的组合做最后尝试，不再 503 | 模型池冷却 **300 秒** |
 | **4** | 所有 tier 都在 TPM 冷却 | 无视冷却标记，取层内密钥试最后一轮 | tier TPM 冷却 **60 秒** |
+| **5** | ④ 构建后全部候选在账号冷却中 | **直接返回 429 + Retry-After: 60**，不走 for 循环（2026-09-24 新增） | `_FRESH_COOLDOWN_SEC = 0` |
+
+> ⚠️ **⑤ 冷却短路**取代了 ④ 的实际执行。此前 ④ 会对每把冷却中的 key 串行发 doomed 请求 → 429 又重置冷却 → 死循环。实测 DeepSeek-Flash 持续限流时 ④ 从未成功，短路后响应从 30-40s 慢 502 降到亚秒级 429。
+
+### per-model rate_limited 快速恢复（2026-09-24 新增）
+
+429 时网关只写 `key_model_statuses.status = rate_limited`（per-model），不改密钥全局状态。`ordered_keys` 此前对 `kms.status != active` 无条件跳过——不看 `rate_limited_until` 是否过期，导致冷却 60 秒过期后仍要等 10 分钟巡检才回 `active`。
+
+现在 per-model 也有 fast-path（与密钥级同理）：`kms.status == rate_limited` 且 `rate_limited_until` 已过期 → 当可用，直接回 L1 调度。**免费 key 被限流后 60 秒自动回池**，不再多走 10 分钟付费兜底。
 
 ### 成功时的额外收益
 
@@ -204,18 +219,30 @@ async def _revive_if_exhausted(key, db):
 
 | 机制 | 时机 | 粒度 | 行为 |
 | --- | --- | --- | --- |
-| 事后冷却 | 已被上游 429 **之后** | (key,模型) / tier | 冷却期内跳过 |
-| **令牌桶** | 请求发出**之前** | (key, 原生模型) | 无令牌 → 换下一把 key |
+| 事后冷却 | 已被上游 429 **之后** | (key,模型) / 账号 | 冷却期内跳过 |
+| **RPM 桶** | 请求发出**之前** | (key, 原生模型) | 每次扣 1，无令牌 → 换下一把 key |
+| **TPM 桶** | 请求发出**之前** | (账号, 原生模型) | 按预估 token 数扣，无令牌 → 换下一把 key |
+
+### 双层设计
+
+RPM 桶按 `(key_id, model)` 维度——每把 key 独立限速请求数。
+
+TPM 桶按 `(provider_id, account_label, model)` 维度——同账号密钥共享上游 TPM 池（多数厂商按账号/组织限流），与 `mark_account_rate_limited` 同口径。DeepSeek-Flash 等快生成模型单次请求可烧上万 token，RPM 桶只扣 1 无法感知 → TPM 桶按预估消耗量（prompt 字符数÷3 + max_tokens）事前扣减。
+
+响应返回后按实际 `usage` 修正 TPM 桶（`tpm_correct`）：实际 < 预估则退还，实际 > 预估则补扣。预估不准没关系，会自动收敛。
 
 ### 参数
 
 | 环境变量 | 默认 | 说明 |
 | --- | :---: | --- |
-| `MTT_TOKEN_BUCKET_RPM` | `20` | 每把 key 每分钟请求数（补充速率 = RPM / 60 令牌/秒） |
-| `MTT_TOKEN_BUCKET_BURST` | `10` | 突发容量（桶满时可连发几个请求不用等补充） |
-| `MTT_TOKEN_BUCKET_MODEL_RPM` | 空 | 按原生模型名覆盖 RPM，格式 `glm-5.2:10,deepseek-v4-flash:15` |
+| `MTT_TOKEN_BUCKET_RPM` | `20` | 每把 key 每分钟请求数（RPM 桶补充速率 = RPM / 60 令牌/秒） |
+| `MTT_TOKEN_BUCKET_BURST` | `10` | RPM 突发容量（桶满时可连发几个请求不用等补充） |
+| `MTT_TOKEN_BUCKET_MODEL_RPM` | 空 | 按原生模型名覆盖 RPM，格式 `deepseek-flash:5` |
+| `MTT_TOKEN_BUCKET_TPM` | `30000` | 每账号每分钟 token 上限（TPM 桶，0=关闭仅用 RPM） |
+| `MTT_TOKEN_BUCKET_TPM_BURST_RATIO` | `0.5` | TPM 突发容量比例（burst = TPM × ratio） |
+| `MTT_TOKEN_BUCKET_MODEL_TPM` | 空 | 按原生模型名覆盖 TPM，格式 `deepseek-flash:10000` |
 
-默认值取 20 RPM 的理由（写在代码注释里）：官方接口上限 5 RPS = 300 RPM，免费层实际 RPM 限额未公布，取 20 留足余量。
+RPM 默认值取 20 的理由：官方接口上限 5 RPS = 300 RPM，免费层实际 RPM 限额未公布，取 20 留足余量。TPM 默认 30000 是保守猜测（商汤未公开），DeepSeek-Flash 实测需调低至 10000。
 
 ### 三条设计原则（代码注释原文摘要）
 
@@ -283,7 +310,10 @@ _DEGRADED_PROBE_GRACE_MINUTES
 | `_PROBE_ATTEMPTS` / `_RETRY_BACKOFF` | `3` / `1.0` s | `health_check.py` | 探测重试 |
 | `_BATCH_CONCURRENCY` | `5` | `health_check.py` | 批量探测并发 |
 | `MTT_TOKEN_BUCKET_RPM` | `20` | `token_bucket.py` | 每 key RPM |
-| `MTT_TOKEN_BUCKET_BURST` | `10` | `token_bucket.py` | 突发容量 |
+| `MTT_TOKEN_BUCKET_BURST` | `10` | `token_bucket.py` | RPM 突发容量 |
+| `MTT_TOKEN_BUCKET_TPM` | `30000` | `token_bucket.py` | 每账号 TPM（0=关闭） |
+| `MTT_TOKEN_BUCKET_TPM_BURST_RATIO` | `0.5` | `token_bucket.py` | TPM 突发比例 |
+| `_FRESH_COOLDOWN_SEC` | `0` | `gateway.py` | 冷却短路阈值（全在冷却→直接 429） |
 
 ## 10. 回归测试
 

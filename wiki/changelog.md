@@ -31,6 +31,25 @@
 
 ---
 
+## [未发布] — 2026-09-24
+
+**新增**
+
+- `feat(relay): 令牌桶加 TPM 维度，从源头减少 DeepSeek-Flash 的 TPM 429` — 新增按 (账号×模型) 的 TPM 令牌桶，与原有 RPM 桶互补。`acquire_token` 接收 `est_tokens` 参数，按预估 token 数事前扣减；响应返回后按实际 `usage` 修正桶（`tpm_correct`）。DeepSeek-Flash 等快生成模型单次请求可烧上万 token，原 RPM 桶只扣请求数无法感知，导致 TPM 配额在上游被打满后才开始事后冷却。
+  ⚠️ 影响面：`token_bucket.py` 新增 TPM 桶 + `try_consume`/`deduct`/`refund`/`tpm_correct`；`gateway.py` 的 `route_chat_completions` 加预估 + 预检 + 事后修正。embeddings/images 保持 RPM-only 不变。
+
+**修复**
+
+- `fix(relay): 全部账号刚被限流时直接返回 429，跳过 final_resort 避免慢 502` — 所有候选 key 的账号限流冷却剩余 >0 时直接返回 429 + `Retry-After: 60`，不再走 final_resort 兜底。final_resort 对每把冷却中的 key 串行发 doomed 请求（含 3 次 network_retry × ConnectTimeout 10s），把 502 延迟拉到 30-40s → dsh 超时杀任务。`balancer.py` 加 `account_rate_limited_remaining()`。
+- `fix(relay): 冷却短路阈值降为 0，彻底消除 final_resort 死循环` — 阈值 50s 留了 10s 缝隙，三把 key 标记时间不同导致 `all()` 判断在缝隙里不成立 → 放行 → 429 又重置冷却 → 死循环。设 0 = 只要全在冷却中就短路。
+- `fix(balancer): per-model rate_limited 冷却过期后立即回池，不等巡检` — `ordered_keys` 的 per-model 状态检查没有 fast-path：`kms.status=rate_limited` 时无条件跳过（不看 `rate_limited_until` 是否过期），导致免费 key 被 429 后即使 60 秒冷却已过期也要等 10 分钟巡检复测才回 `active` → 这 10 分钟一直走付费兜底层。改为与密钥级 fast-path 同理。
+
+**工程**
+
+- `config: DeepSeek-Flash 令牌桶 RPM=5/TPM=10000，适配 SenseNova 限流` — Docker 日志确认原生模型名 `deepseek-flash`，原默认 RPM=20 远超上游实际限额触发 `EndpointRPMExceeded`；TPM=30000 也偏高。docker-compose.yml 加 `MTT_TOKEN_BUCKET_MODEL_RPM` 和 `MTT_TOKEN_BUCKET_MODEL_TPM` 环境变量。
+
+---
+
 ## [0.1.0] — 2026-09-01 ~ 2026-09-14
 
 ### 2026-09-14
@@ -141,7 +160,7 @@
 
 | 项 | 状态 | 说明 |
 | --- | --- | --- |
-| Redis | 声明未使用 | `redis>=5.0` 已声明、compose 已起服务，但 `app/` 内零调用；多副本部署会各自持有调度状态 |
+| Redis | 热缓存已接线 | `ModelMapping` / `ModelPricing` 缓存已接 Redis（commit fc14053），不可用时降级 DB；冷却与令牌桶状态仍在单进程内存，多副本部署不共享 |
 | 原生 Anthropic / Gemini 格式翻译 | 未接入 | 请求体翻译未做（探测层已支持 `anthropic` / `gemini_models` 两种方式）；如需可考虑引入 LiteLLM |
 | LICENSE | 缺失 | 无 `LICENSE` 文件，`pyproject.toml` / `package.json` 也无 license 字段 |
 | `.zcode/plans/` | 内容过时 | 早期实施方案写的是 LiteLLM / asyncmy / Element Plus，实际落地为 httpx / aiomysql / Naive UI |

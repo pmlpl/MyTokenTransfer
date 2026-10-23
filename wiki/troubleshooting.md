@@ -156,7 +156,7 @@ MTT_TOKEN_BUCKET_MODEL_RPM: "glm-5.2:5,deepseek-v4-flash:15"
 
 ### 一直 503 `无可用密钥（全部失效/限流）`
 
-这是四级兜底**全部用尽**的结果（[scheduling.md](scheduling.md)）。诊断顺序：
+这是五级兜底**全部用尽**的结果（[scheduling.md](scheduling.md)）。诊断顺序：
 
 ```bash
 curl http://127.0.0.1:8085/api/stats/overview -H "Authorization: Bearer <session-token>"

@@ -37,9 +37,9 @@
 | --- | --- |
 | 多账号密钥统一管理 | Fernet 静态加密存储、掩码展示、分组、标签、权重、批量健康测试 |
 | OpenAI 兼容转发 | `/v1/chat/completions`（含流式 SSE）、`/v1/embeddings`、`/v1/images/generations`、`/v1/models` |
-| 多账号密钥池 + 四级兜底 | 见 [调度与兜底](#调度与兜底)；支持跨供应商 fallback（带虚拟模型 → 原生模型名映射） |
+| 多账号密钥池 + 五级兜底 | 见 [调度与兜底](#调度与兜底)；支持跨供应商 fallback（带虚拟模型 → 原生模型名映射） |
 | 密钥 × 模型细粒度状态 | 状态不再只有「整把 key 好坏」，而是落到 (key, 模型) 维度：某模型积分池 429 只冷却该组合 |
-| 令牌桶事前控速 | 按 (key, 原生模型) 在**请求发出前**限速，与「事后 429 冷却」互补，从源头减少 429 |
+| 令牌桶事前控速 | **双层令牌桶**：RPM 桶按 (key, 模型) 限请求数 + TPM 桶按 (账号, 模型) 限 token 数；响应后按实际 usage 修正 TPM 桶。与「事后 429 冷却」互补，从源头减少 429 |
 | 缓存亲和路由 | 按消息稳定前缀哈希固定到同一把上游 key，复用其前缀缓存，提升缓存命中率 |
 | 计费 | 按模型定价（输入 / 输出 / 缓存命中），支持高峰 / 空闲双档（时段见 [计费与用量](#计费与用量)） |
 | 用量统计 | 近 24 小时滚动波形（跨午夜连续）、多日聚合、按密钥 / 按模型视图，成本随定价档自动切换 |
@@ -237,9 +237,12 @@ npm run preview    # 预览构建产物
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `MTT_TOKEN_BUCKET_RPM` | `20` | 每把 key 每分钟请求数上限（令牌桶补充速率） |
-| `MTT_TOKEN_BUCKET_BURST` | `10` | 突发容量（桶满时可连发几个请求） |
-| `MTT_TOKEN_BUCKET_MODEL_RPM` | 空 | 按原生模型名覆盖 RPM，格式 `glm-5.2:10,deepseek-v4-flash:15` |
+| `MTT_TOKEN_BUCKET_RPM` | `20` | 每把 key 每分钟请求数上限（RPM 桶补充速率） |
+| `MTT_TOKEN_BUCKET_BURST` | `10` | RPM 突发容量（桶满时可连发几个请求） |
+| `MTT_TOKEN_BUCKET_MODEL_RPM` | 空 | 按原生模型名覆盖 RPM，格式 `deepseek-flash:5` |
+| `MTT_TOKEN_BUCKET_TPM` | `30000` | 每账号每分钟 token 上限（TPM 桶，0=关闭仅用 RPM） |
+| `MTT_TOKEN_BUCKET_TPM_BURST_RATIO` | `0.5` | TPM 突发容量比例（burst = TPM × ratio） |
+| `MTT_TOKEN_BUCKET_MODEL_TPM` | 空 | 按原生模型名覆盖 TPM，格式 `deepseek-flash:10000` |
 
 生成随机凭据的参考做法：
 
@@ -373,15 +376,16 @@ Base URL: http://<Tailscale-IP>:<WEB_PORT>/v1     # 管理台 Playground 页的�
 
 请求按 **Tier 升序**、层内按策略（`round_robin` / `weighted` / `priority`，含会话缓存亲和哈希固定同 key）生成候选队列，逐个尝试。四个兜底层级，仅当前面无人可试时才启用后一级：
 
-1. **正常路径**：`active` 密钥；限流冷却到期的直接视为可用（省一个巡检周期）。
+1. **正常路径**：`active` 密钥；限流冷却到期的直接视为可用（省一个巡检周期）。per-model `rate_limited` 冷却过期后同样立即回池（fast-path），不等巡检。
 2. **全池 exhausted**：追加最久未测的 `exhausted` 密钥，赌额度窗口已滚动恢复（`exhausted` 复测周期 **10 分钟**）。
 3. **模型池冷却**：同一把 key 上某模型积分池 429 只冷却 **(key, 模型) 组合 300 秒**，不标死整把 key；全组合冷却时追加冷却组合做最后尝试。
-4. **tier TPM 冷却**：高并发打满共享 TPM → 整层 **60 秒**冷却，全层冷却时无视冷却取层内密钥试最后一轮。
+4. **账号 TPM 冷却**：高并发打满共享 TPM → 同账号 **60 秒**冷却，全池冷却时无视冷却取层内密钥试最后一轮。
+5. **冷却短路**：④ 构建后如果全部候选都在账号冷却中，**直接返回 429 + `Retry-After: 60`**，不走 for 循环——避免对冷却中的 key 串行发 doomed 请求导致 502 延迟 30-40s 和冷却被反复重置。
 
 补充行为：
 
 - 网络层瞬时故障（TLS 被掐 / 连接重置）**原地重试 3 次**（退避 1s）；最后尝试拿到 200 即把密钥自动拉回 `active` 并 resolve 告警。
-- **令牌桶事前控速**：发出请求前按 `(key, 原生模型)` 检查速率，无令牌直接换下一把 key；**永不硬失败**——全部 key 都无令牌时短暂等待后放行。
+- **双层令牌桶事前控速**：发出请求前先检查 RPM 桶（按 key 扣 1）和 TPM 桶（按预估 token 数扣，响应后按实际 usage 修正）。无令牌直接换下一把 key；**永不硬失败**——全部 key 都无令牌时顾问放行。
 - **非 active 密钥探测保护期 5 分钟**：刚被判 degraded 的 key，小探针能过但大请求仍可能限流，保护期内探测成功不恢复 `active`，避免状态横跳。
 - **定时巡检**（APScheduler）：每 **10 分钟**重测所有非 `active` 且非 `disabled` 的密钥；每日 **02:30** 预聚合 rollup；启动时回填近 **60 天** 用量。
 
@@ -557,7 +561,7 @@ cd frontend && npm run build              # vue-tsc 类型检查 + 构建通过
 | 模块职责与数据流 | [wiki/architecture.md](wiki/architecture.md) |
 | 部署细节 / 环境变量 / 备份恢复 | [wiki/deployment.md](wiki/deployment.md) |
 | 网关四个端点怎么用 | [wiki/gateway-api.md](wiki/gateway-api.md) |
-| 调度、Tier、四级兜底 | [wiki/scheduling.md](wiki/scheduling.md) |
+| 调度、Tier、五级兜底 | [wiki/scheduling.md](wiki/scheduling.md) |
 | 定价档位与用量聚合 | [wiki/billing-and-usage.md](wiki/billing-and-usage.md) |
 | 43 个管理/网关端点清单 | [wiki/api-reference.md](wiki/api-reference.md) |
 | 报错排查 | [wiki/troubleshooting.md](wiki/troubleshooting.md) |

@@ -23,8 +23,8 @@
 
 1. 它是个 **API Key 池 + OpenAI 兼容网关**：客户端只认「一个地址 + 一个令牌」。
 2. 数据流：客户端 → nginx → FastAPI `/v1/*` → `relay/gateway` 编排尝试序列 → `relay/balancer` 选 key → httpx 直连上游 → `relay/accounting` 落库计费。
-3. 最核心的设计是**四级兜底**（[scheduling.md](scheduling.md)）：正常 → 全池耗尽赌恢复 → 模型池级冷却 → tier TPM 级冷却。四级都试过才 503。
-4. 所有状态（冷却、令牌桶）都在**单进程内存**里，Redis 起了但没接线。
+3. 最核心的设计是**五级兜底**（[scheduling.md](scheduling.md)）：正常 → 全池耗尽赌恢复 → 模型池级冷却 → 账号 TPM 级冷却 → 冷却短路返回 429。五级都试过才 503。
+4. 冷却与令牌桶状态在**单进程内存**里；Redis 已接线用于 `ModelMapping`/`ModelPricing` 热缓存（不可用时降级 DB）。多副本部署仍不共享调度状态。
 
 ---
 
@@ -40,7 +40,7 @@
 | `architecture.md` | 模块划分、数据流、数据模型 | 改动模块边界或表结构时 |
 | `deployment.md` | 部署、环境变量、备份 | 改动 compose / 脚本 / 配置项时 |
 | `gateway-api.md` | 对外 `/v1/*` 端点契约 | 改动网关行为时 |
-| `scheduling.md` | Tier 调度与四级兜底 | 改动 `relay/balancer.py`、`token_bucket.py` 时 |
+| `scheduling.md` | Tier 调度与五级兜底 | 改动 `relay/balancer.py`、`token_bucket.py`、`gateway.py` 时 |
 | `billing-and-usage.md` | 计费口径与用量聚合 | 改动 `relay/accounting.py`、`services/usage.py` 时 |
 | `api-reference.md` | 43 个端点的清单速查 | 增删路由时 |
 | `troubleshooting.md` | 现象 → 原因 → 处理 | 踩到新坑并解决后 |

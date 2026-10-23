@@ -259,7 +259,7 @@ http://<Tailscale-IP>:<WEB_PORT>/v1
 | `401` | `Missing gateway token` | `require_gateway` | 加 `Authorization` 头 |
 | `401` | `Invalid gateway token` | `require_gateway` | 令牌对不上根 `.env` 的 `GATEWAY_TOKEN` |
 | `404` | `未找到 model '<x>' 对应的通道` | `_load_channel` | 通道未建 / `is_active=false` / 名字不一致 |
-| `503` | 上游全部候选耗尽 | `relay/gateway.py` | 四级兜底全试过，见 [scheduling.md](scheduling.md)；查告警与日志页 |
+| `503` | 上游全部候选耗尽 | `relay/gateway.py` | 五级兜底全试过，见 [scheduling.md](scheduling.md)；查告警与日志页 |
 | 上游原样 | 上游 4xx/5xx 响应体 | 单次尝试失败但整体成功时不会暴露 | 见调用日志 |
 
 ## 相关页面

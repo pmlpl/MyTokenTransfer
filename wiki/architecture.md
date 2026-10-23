@@ -76,11 +76,11 @@
 | 9 | `relay/gateway.py` | httpx 直连上游；请求体里的 `model` 换成**原生模型名**（经 `model_mappings` 映射） |
 | 10 | `relay/errors.py` | 失败时分类：限流 / 额度 / 认证 / 其他 → 交给 balancer 标状态 |
 | 11 | `relay/balancer.py` | 按分类标记 key 或 `(key, 模型)` 或整个 tier 冷却，返回下一个候选 |
-| 12 | 循环 8–11 | 直到成功、或四级兜底全部用尽 → 503 |
+| 12 | 循环 8–11 | 直到成功、或五级兜底全部用尽 → 503 |
 | 13 | `relay/accounting.py` | 用**独立 DB 会话**写 `call_logs`（含 tokens / cost / 延迟 / 状态）—— 独立会话是为了应对「流式响应中途客户端断开、主会话已关闭」 |
 | 14 | 响应 | 非流式：直接返回上游 JSON；流式：SSE 逐块透传，结束后补写日志 |
 
-> 关键设计：`balancer` **完全不碰 HTTP**，只做「选谁、标记谁」；`gateway` 负责 HTTP 编排。这个切分（`refactor(relay): 拆 gateway 到 balancer + accounting`）是后来四级兜底能持续演进而没有变成一坨 if-else 的前提。
+> 关键设计：`balancer` **完全不碰 HTTP**，只做「选谁、标记谁」；`gateway` 负责 HTTP 编排。这个切分（`refactor(relay): 拆 gateway 到 balancer + accounting`）是后来五级兜底能持续演进而没有变成一坨 if-else 的前提。
 
 ## 3. 模块职责表
 
@@ -217,7 +217,7 @@ frontend/src/
 
 ## 相关页面
 
-- [scheduling.md](scheduling.md) —— 四级兜底与冷却参数（本页第 2 节的第 7–12 步展开）
+- [scheduling.md](scheduling.md) —— 五级兜底与冷却参数（本页第 2 节的第 7–12 步展开）
 - [billing-and-usage.md](billing-and-usage.md) —— 第 13 步的成本怎么算
 - [deployment.md](deployment.md) —— 拓扑怎么部署起来
 - [api-reference.md](api-reference.md) —— 端点清单
