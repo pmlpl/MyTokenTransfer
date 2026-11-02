@@ -1,6 +1,6 @@
 # 调度与兜底
 
-> 一句话定位：这是本项目最核心的机制 —— 一次请求从上到下有四层「还有谁能试」的兜底，只有四层全部用尽才返回 503。目标是把「上游偶发限流/额度窗口滚动/网络抖动」这些噪音吸收掉，不让客户端看见。
+> 一句话定位：这是本项目最核心的机制 —— 一次请求从上到下有多层「还有谁能试」的兜底，只有全部用尽才返回 503。目标是把「上游偶发限流/额度窗口滚动/网络抖动」这些噪音吸收掉，不让客户端看见。
 
 相关页面：[architecture.md](architecture.md)（数据流）· [gateway-api.md](gateway-api.md)（503 是什么）· [troubleshooting.md](troubleshooting.md)（一直 429 怎么办）
 
@@ -101,7 +101,7 @@ allow_tier_limited  = attempts 非空 and 所有 attempt 都处于 tier TPM 冷�
 | 1 | `tier_is_rate_limited(tier.id)` 且未豁免 | 跳过 |
 | 2 | `model_quota_is_limited(key.id, virtual)` 且未豁免 | 跳过 |
 | 3 | `resolve_native()` 取原生模型名 | — |
-| 4 | **`acquire_token(key.id, native, est_tokens, provider_id, account_label)` 令牌桶** | 跳过（换下一把 key，**不硬失败**）；RPM 桶按 key 扣 1、TPM 桶按预估 token 数扣（全空时顾问放行） |
+| 4 | **`acquire_rpm(key.id, native)` + `tpm_reserve(账号, native, est)`** | RPM 桶空 → 换下一把 key；TPM 预算不够 → 记下等待秒数、换下一把；全部被挡则在循环外统一等待或 429 |
 | 5 | `base_url_for(tier.provider)` 非空 | 记 `供应商 X 缺少 base_url`，跳过 |
 | 6 | `decrypt_value(key.key_value)` 解密钥 | **把 key 标 `invalid`**（"密文解密失败"），跳过 |
 | 7 | 发请求（`_send_with_retry`） | 见下 |
@@ -213,7 +213,7 @@ async def _revive_if_exhausted(key, db):
 
 一旦拿到 200，即使**流中途出错也不再切换 key**（已经吐了一部分内容给客户端，换 key 会导致响应内容错乱）。stream 上出现的异常只记日志，不会重试。
 
-## 6. 令牌桶：事前限速（`relay/token_bucket.py`）
+## 6. 限速：RPM 桶 + TPM 滚动窗口（`relay/token_bucket.py`）
 
 与「事后冷却」互补，目标是从**源头**减少 429：
 
@@ -221,15 +221,42 @@ async def _revive_if_exhausted(key, db):
 | --- | --- | --- | --- |
 | 事后冷却 | 已被上游 429 **之后** | (key,模型) / 账号 | 冷却期内跳过 |
 | **RPM 桶** | 请求发出**之前** | (key, 原生模型) | 每次扣 1，无令牌 → 换下一把 key |
-| **TPM 桶** | 请求发出**之前** | (账号, 原生模型) | 按预估 token 数扣，无令牌 → 换下一把 key |
+| **TPM 预算** | 请求发出**之前** | (账号, 原生模型) | 滚动 60 秒窗口记账，放不下则短暂等待或 429 |
 
-### 双层设计
+### 为什么 TPM 不是令牌桶
 
-RPM 桶按 `(key_id, model)` 维度——每把 key 独立限速请求数。
+早期版本用经典令牌桶（TPM=30000，burst 比例 0.5 → 容量 15000）。实测单次 agent 请求平均 **33.6 万 prompt tokens**（长会话把整段历史每次全带上，最大 96 万），**比桶容量大 20 倍**——`try_consume` 永远失败，`any_tpm_headroom` 永远为 False，于是每个请求都走「顾问放行」，TPM 只剩事后补扣，把桶打成深负值，**事前控速彻底失效**。
 
-TPM 桶按 `(provider_id, account_label, model)` 维度——同账号密钥共享上游 TPM 池（多数厂商按账号/组织限流），与 `mark_account_rate_limited` 同口径。DeepSeek-Flash 等快生成模型单次请求可烧上万 token，RPM 桶只扣 1 无法感知 → TPM 桶按预估消耗量（prompt 字符数÷3 + max_tokens）事前扣减。
+现在改为**滚动 60 秒窗口**：窗口里存 `(时间戳, token 数)`，只保留最近 60 秒，窗口和为「本分钟已用」。
 
-响应返回后按实际 `usage` 修正 TPM 桶（`tpm_correct`）：实际 < 预估则退还，实际 > 预估则补扣。预估不准没关系，会自动收敛。
+准入判定：
+- `已用 + 预估 ≤ 预算` → 放行，并记入窗口
+- 放不下 → 返回还需等待的秒数（最老条目滚出窗口所需时间）
+- **单条请求比整个预算还大** → 窗口为空时放行一次（否则这条请求永远发不出去）
+
+gateway 侧：全部候选都不放行时，若最短等待 ≤ `TPM_MAX_WAIT`（默认 8 秒）就 `sleep` 后重试一轮，否则返回 **429 + 精确 `Retry-After`**。
+
+### 自适应预算（AIMD）
+
+预算不是写死的，由上游反馈学习（SenseNova 的 TPM 上限未公开）：
+
+| 事件 | 动作 |
+| --- | --- |
+| 初始化 | `budget = 种子`（默认 40 万，可按模型覆盖） |
+| 请求成功 | `budget = max(budget, actual × 1.15)` —— 能成功说明预算至少这么大 |
+| 每 10 次成功 | `budget ×= 1.02` 慢速探测上调 |
+| 429 且窗口消耗 ≥ 预算 × 0.5 | `budget = min(budget × 0.6, est × 0.9)`，**每 30 秒最多降一次** |
+| 429 但窗口消耗很低 | 不降 —— 大概率是并发/RPM 限制，误降会震荡 |
+
+钳制：`floor = max(TPM_MIN, 种子 × 0.1)`，`ceil = TPM_MAX`。
+
+结算与退款：
+- 成功有 `usage` → `tpm_settle(预留, 实际)` 覆盖窗口里的预估值
+- 请求失败（网络异常 / 非 200 / 解密失败）→ `tpm_release(预留)` 退回，失败不该白占预算
+
+### 预估校准
+
+`_estimate_tokens` 用 `prompt 字符数 ÷ 3 + max_tokens`，对中文是明显低估（一个汉字约 1 token）。按原生模型维护 `actual / 预估` 的 EMA（钳制 0.5–5.0），下次预估乘上它。
 
 ### 参数
 
@@ -238,19 +265,21 @@ TPM 桶按 `(provider_id, account_label, model)` 维度——同账号密钥共�
 | `MTT_TOKEN_BUCKET_RPM` | `20` | 每把 key 每分钟请求数（RPM 桶补充速率 = RPM / 60 令牌/秒） |
 | `MTT_TOKEN_BUCKET_BURST` | `10` | RPM 突发容量（桶满时可连发几个请求不用等补充） |
 | `MTT_TOKEN_BUCKET_MODEL_RPM` | 空 | 按原生模型名覆盖 RPM，格式 `deepseek-flash:5` |
-| `MTT_TOKEN_BUCKET_TPM` | `30000` | 每账号每分钟 token 上限（TPM 桶，0=关闭仅用 RPM） |
-| `MTT_TOKEN_BUCKET_TPM_BURST_RATIO` | `0.5` | TPM 突发容量比例（burst = TPM × ratio） |
-| `MTT_TOKEN_BUCKET_MODEL_TPM` | 空 | 按原生模型名覆盖 TPM，格式 `deepseek-flash:10000` |
+| `MTT_TOKEN_BUCKET_TPM` | `400000` | TPM 预算种子（自适应起点，非硬上限；`0`=关闭 TPM） |
+| `MTT_TOKEN_BUCKET_TPM_MIN` | `50000` | 预算下限 |
+| `MTT_TOKEN_BUCKET_TPM_MAX` | `4000000` | 预算上限 |
+| `MTT_TOKEN_BUCKET_TPM_MAX_WAIT` | `8` | 预算不足时最多等待秒数 |
+| `MTT_TOKEN_BUCKET_MODEL_TPM` | 空 | 按原生模型名覆盖预算种子，格式 `glm-5.2:800000` |
 
-RPM 默认值取 20 的理由：官方接口上限 5 RPS = 300 RPM，免费层实际 RPM 限额未公布，取 20 留足余量。TPM 默认 30000 是保守猜测（商汤未公开），DeepSeek-Flash 实测需调低至 10000。
+RPM 默认值取 20 的理由：官方接口上限 5 RPS = 300 RPM，免费层实际 RPM 限额未公布，取 20 留足余量。TPM 种子 40 万来自实测单次请求 33.6 万的量级。
 
 ### 三条设计原则（代码注释原文摘要）
 
 1. **单进程 uvicorn，无锁** —— 事件循环内不存在 `await` 的算术操作没有竞态。
-2. **令牌桶永不导致硬失败** —— 全部 key 都无令牌时，由 gateway 短暂等待后放行。
+2. **不硬阻** —— 预算不够先短暂等待，等不及才 429（带真实秒数），不再无脑放行。
 3. **速率可按模型覆盖** —— 不同模型配额不同。
 
-> 这三条也解释了为什么多副本部署不成立：桶是**进程内全局**的，两个副本就是两份额度账本。
+> 这三条也解释了为什么多副本部署不成立：窗口和预算是**进程内全局**的，两个副本就是两份额度账本。
 
 ## 7. 缓存亲和路由
 
@@ -311,8 +340,9 @@ _DEGRADED_PROBE_GRACE_MINUTES
 | `_BATCH_CONCURRENCY` | `5` | `health_check.py` | 批量探测并发 |
 | `MTT_TOKEN_BUCKET_RPM` | `20` | `token_bucket.py` | 每 key RPM |
 | `MTT_TOKEN_BUCKET_BURST` | `10` | `token_bucket.py` | RPM 突发容量 |
-| `MTT_TOKEN_BUCKET_TPM` | `30000` | `token_bucket.py` | 每账号 TPM（0=关闭） |
-| `MTT_TOKEN_BUCKET_TPM_BURST_RATIO` | `0.5` | `token_bucket.py` | TPM 突发比例 |
+| `MTT_TOKEN_BUCKET_TPM` | `400000` | `token_bucket.py` | TPM 预算种子（0=关闭） |
+| `MTT_TOKEN_BUCKET_TPM_MIN` / `_MAX` | `50000` / `4000000` | `token_bucket.py` | 自适应预算上下限 |
+| `MTT_TOKEN_BUCKET_TPM_MAX_WAIT` | `8` s | `token_bucket.py` | 预算不足时最多等待秒数 |
 | `_FRESH_COOLDOWN_SEC` | `0` | `gateway.py` | 冷却短路阈值（全在冷却→直接 429） |
 
 ## 10. 回归测试

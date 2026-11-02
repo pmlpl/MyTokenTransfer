@@ -59,11 +59,19 @@ services:
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
       REDIS_PASSWORD: ${REDIS_PASSWORD:-}
 
-      # —— 令牌桶限流：DeepSeek-Flash 快生成 → TPM/RPM 双限流，默认值偏高 ——
-      # RPM：SenseNova 免费层未公布，20 太高触发 EndpointRPMExceeded，降到 5
-      # TPM：30000 对 GLM-5.2 够用，DeepSeek-Flash 降到 10000（原生模型名 deepseek-flash）
+      # —— 令牌桶限流：RPM 按请求数、TPM 按 token 数 ——
+      # RPM：SenseNova 免费层未公布，20 太高触发 EndpointRPMExceeded，DeepSeek-Flash 降到 5
       MTT_TOKEN_BUCKET_MODEL_RPM: ${MTT_TOKEN_BUCKET_MODEL_RPM:-deepseek-flash:5}
-      MTT_TOKEN_BUCKET_MODEL_TPM: ${MTT_TOKEN_BUCKET_MODEL_TPM:-deepseek-flash:10000}
+      # TPM：不再用固定令牌桶（单次 agent 请求 30 万+ token，桶容量装不下
+      # 任何一条真实请求 → 恒空 → 恒放行 → 完全失效）。改为滚动 60 秒窗口
+      # + 自适应预算，这里的值只是自学习起点与上下限，不是硬上限。
+      MTT_TOKEN_BUCKET_TPM: ${MTT_TOKEN_BUCKET_TPM:-400000}
+      MTT_TOKEN_BUCKET_TPM_MIN: ${MTT_TOKEN_BUCKET_TPM_MIN:-50000}
+      MTT_TOKEN_BUCKET_TPM_MAX: ${MTT_TOKEN_BUCKET_TPM_MAX:-4000000}
+      # 预算不足时最多等多少秒再发；超过则直接 429 + 精确 Retry-After
+      MTT_TOKEN_BUCKET_TPM_MAX_WAIT: ${MTT_TOKEN_BUCKET_TPM_MAX_WAIT:-8}
+      # 按原生模型覆盖预算种子，格式 "glm-5.2:800000,deepseek-flash:100000"
+      MTT_TOKEN_BUCKET_MODEL_TPM: ${MTT_TOKEN_BUCKET_MODEL_TPM:-}
 
       # —— CORS：同源反代只需允许前端 http 地址；若要额外放行直连 8082 端口可自行追加 ——
       CORS_ORIGINS: >-
@@ -124,7 +132,10 @@ services:
       - --maxmemory-policy
       - allkeys-lru         # 内存满时按 LRU 淘汰，对 pin 这种短 TTL 友好
     ports:
-      - "127.0.0.1:6379:6379"   # 仅宿主机可连；容器间走 service 名
+      # 仅宿主可连，方便本地调试；容器间一律走 service 名 redis:6379，不经过这里。
+      # 宿主端口用 6380 避开本机其他 Redis（如 6379 已被别的项目占用）。
+      # 注意：换的是**宿主端口**，不是 Redis 库号（/0 /1 /2 是同一个实例里的逻辑库，共用同一端口）。
+      - "127.0.0.1:${REDIS_HOST_PORT:-6380}:6379"
     volumes:
       - redis_data:/data
     healthcheck:

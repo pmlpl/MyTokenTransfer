@@ -30,11 +30,22 @@ from app.relay.balancer import (
     mark_model_quota_limited,
     model_quota_is_limited,
     ordered_keys,
+    reset_account_backoff,
     resolve_native,
     routing_affinity,
 )
-from app.relay.errors import classify_error, is_model_pool_quota
-from app.relay.token_bucket import acquire_token, tpm_available, tpm_correct
+from app.relay.errors import classify_error, extract_error_code, is_model_pool_quota
+from app.relay.token_bucket import (
+    acquire_rpm,
+    ceil_div_seconds,
+    max_wait_seconds,
+    release_rpm,
+    tpm_on_rate_limit,
+    tpm_release,
+    tpm_reserve,
+    tpm_settle,
+    tpm_wait,
+)
 from app.services.health_check import _join
 
 log = structlog.get_logger("relay")
@@ -266,6 +277,44 @@ def _estimate_tokens(body: dict) -> int:
     return prompt_est + output_est
 
 
+# 预估偏差校准：len/3 对中文是明显低估（一个汉字约 1 token，不是 1/3）。
+# 按原生模型维护一个 actual/预估 的 EMA，下次预估乘上它，让 TPM 记账贴近真实。
+# 钳制在 0.5–5.0，避免单次异常把系数带飞。
+_EST_FACTOR: dict[str, float] = {}
+_EST_FACTOR_MIN = 0.5
+_EST_FACTOR_MAX = 5.0
+_EST_FACTOR_ALPHA = 0.3
+
+
+def _apply_est_factor(model: str, est: int) -> int:
+    factor = _EST_FACTOR.get(model)
+    if not factor:
+        return est
+    return max(1, int(est * factor))
+
+
+def _update_est_factor(model: str, base_est: int, actual: int) -> None:
+    """用实际 usage 修正该模型的预估系数（base_est 为未乘系数的原值）。"""
+    if base_est <= 0 or actual <= 0:
+        return
+    ratio = min(_EST_FACTOR_MAX, max(_EST_FACTOR_MIN, actual / base_est))
+    prev = _EST_FACTOR.get(model)
+    _EST_FACTOR[model] = (
+        ratio if prev is None else prev * (1 - _EST_FACTOR_ALPHA) + ratio * _EST_FACTOR_ALPHA
+    )
+
+
+def _refund_budget(key: ApiKey, native: str, reserved: int) -> None:
+    """请求没发出去或失败：把 RPM 令牌和 TPM 预留都退回。
+
+    失败请求不应该占用限速预算——否则连续失败会把桶抽干，
+    让后续正常请求也被迫排队。
+    """
+    release_rpm(key.id, native)
+    if reserved > 0:
+        tpm_release(key.provider_id, key.account_label, native, reserved)
+
+
 async def route_chat_completions(
     channel: Channel, body: dict, db: AsyncSession
 ) -> JSONResponse | StreamingResponse:
@@ -283,32 +332,65 @@ async def route_chat_completions(
     last_error = "无可用上游"
     allow_quota_limited, allow_account_limited = _cooldown_exemptions(attempts, virtual)
 
-    # 预检 TPM：是否有任何 key 的账号 TPM 桶有余量。
-    # 有余量时跳过桶空的 key（换有余量的账号）；全空时顾问放行（不硬阻）。
-    any_tpm_headroom = False
+    # ── TPM 预算准入 ────────────────────────────────────────────────
+    # 先看有没有哪把候选 key 当前预算放得下本请求。全放不下时：
+    # 等得不久（≤ MTT_TOKEN_BUCKET_TPM_MAX_WAIT）就短暂等待再进主循环，
+    # 等太久则直接 429 + 精确 Retry-After——不把注定 429 的请求发出去。
+    min_wait: float | None = None
     for tier, key in attempts:
         if account_is_rate_limited(key.provider_id, key.account_label) and not allow_account_limited:
             continue
         if model_quota_is_limited(key.id, virtual) and not allow_quota_limited:
             continue
         native_check = await resolve_native(virtual, tier.provider_id, db)
-        if tpm_available(key.provider_id, key.account_label, native_check) >= est_tokens:
-            any_tpm_headroom = True
+        wait = tpm_wait(
+            key.provider_id, key.account_label, native_check,
+            _apply_est_factor(native_check, est_tokens),
+        )
+        if wait <= 0.0:
+            min_wait = 0.0
             break
+        min_wait = wait if min_wait is None else min(min_wait, wait)
+
+    if min_wait and min_wait > 0.0:
+        if min_wait > max_wait_seconds():
+            secs = ceil_div_seconds(min_wait)
+            log.info("tpm_budget_exhausted_429", channel_id=channel.id,
+                     virtual_model=virtual, wait_s=round(min_wait, 1))
+            return JSONResponse(
+                status_code=429,
+                headers={"Retry-After": str(secs)},
+                content={"error": {
+                    "message": f"本分钟 token 预算不足，请 {secs} 秒后重试",
+                    "type": "rate_limited",
+                }},
+            )
+        log.info("tpm_wait", channel_id=channel.id, virtual_model=virtual,
+                 wait_s=round(min_wait, 2))
+        await asyncio.sleep(min_wait + 0.05)  # 多等 50ms 让窗口真正滚过去
 
     # 全部账号在限流冷却中 → 直接返回 429 + Retry-After，不走 final_resort。
     # final_resort 会对每把冷却中的 key 串行发 doomed 请求 → 429 又重置冷却
     # 计时器 → 冷却永远过不去 → 死循环。设阈值 0 = 只要全在冷却就短路。
+    # Retry-After 用真实剩余冷却秒数，而非固定 60——退避到 15 分钟时提前
+    # 重试只会白挨一次 429。
     if attempts and all(
         account_rate_limited_remaining(k.provider_id, k.account_label) > _FRESH_COOLDOWN_SEC
         for _, k in attempts
     ):
-        log.info("all_fresh_cooldown_429", channel_id=channel.id, virtual_model=virtual)
+        remaining = max(
+            account_rate_limited_remaining(k.provider_id, k.account_label)
+            for _, k in attempts
+        )
+        log.info("all_fresh_cooldown_429", channel_id=channel.id,
+                 virtual_model=virtual, retry_after_s=int(remaining))
         return JSONResponse(
             status_code=429,
-            headers={"Retry-After": "60"},
+            headers={"Retry-After": str(ceil_div_seconds(remaining))},
             content={"error": {"message": "所有上游账号处于限流冷却期", "type": "rate_limited"}},
         )
+
+    budget_blocked_wait: float | None = None
 
     for tier, key in attempts:
         if account_is_rate_limited(key.provider_id, key.account_label) and not allow_account_limited:
@@ -316,23 +398,31 @@ async def route_chat_completions(
         if model_quota_is_limited(key.id, virtual) and not allow_quota_limited:
             continue  # 模型池冷却：该 key 上本模型的积分池刚报 429
         native = await resolve_native(virtual, tier.provider_id, db)
-        # 令牌桶事前控速：RPM（按 key）+ TPM（按账号）。
-        # TPM 有余量的 key 优先；全空时顾问放行（tpm_consumed=False，事后按实际补扣）。
-        acquired = acquire_token(
-            key.id, native, est_tokens=est_tokens,
-            provider_id=key.provider_id, account_label=key.account_label,
+        # 令牌桶事前控速：RPM（按 key）+ TPM 预算（按账号×模型）。
+        # 预算不够只跳过这把 key；全部跳过时在循环外统一返回 429。
+        if not acquire_rpm(key.id, native):
+            continue  # RPM 桶空：换下一把，不占预算
+        reserved = _apply_est_factor(native, est_tokens)
+        allowed, wait = tpm_reserve(
+            key.provider_id, key.account_label, native, reserved,
         )
-        if not acquired and any_tpm_headroom:
-            continue  # 跳过桶空的 key，换有余量的账号
+        if not allowed:
+            release_rpm(key.id, native)  # 预算不足，RPM 令牌退回
+            budget_blocked_wait = (
+                wait if budget_blocked_wait is None else min(budget_blocked_wait, wait)
+            )
+            continue
         base = base_url_for(tier.provider)
         if not base:
             last_error = f"供应商 {tier.provider.slug} 缺少 base_url"
+            _refund_budget(key, native, reserved)
             continue
         url = _join(base, "chat/completions")
         try:
             raw = decrypt_value(key.key_value)
         except Exception:
             await mark_key(key, KeyStatus.invalid, db, message="密文解密失败")
+            _refund_budget(key, native, reserved)
             continue
 
         payload = _build_payload(body, native, stream, base_url=base)
@@ -351,6 +441,7 @@ async def route_chat_completions(
                     await client.aclose()
                     last_error = f"{type(e).__name__}: {e}"
                     should_continue = True  # 网络异常不原地重试，走外层换 key
+                    _refund_budget(key, native, reserved)
                     break
                 if response.status_code != 200:
                     await response.aread()
@@ -370,7 +461,21 @@ async def route_chat_completions(
                         continue
                     await client.aclose()
                     retry, mark, msg = classify_error(response.status_code, err_text)
+                    log.info("upstream_error_classified",
+                             channel_id=channel.id, key_id=key.id,
+                             provider_id=tier.provider_id,
+                             virtual_model=virtual, native_model=native,
+                             http_status=response.status_code,
+                             error_code=extract_error_code(err_text),
+                             mark=mark.value if mark else None, retry=retry)
                     _is_model_quota = is_model_pool_quota(err_text) or "entitlement" in (err_text or "").lower()
+                    if response.status_code == 429:
+                        # 429 说明不是"没发出去"，但也没消耗 token：退回预留，
+                        # 同时让自适应预算按 AIMD 下调。
+                        tpm_on_rate_limit(key.provider_id, key.account_label, native, reserved)
+                        _refund_budget(key, native, reserved)
+                    else:
+                        _refund_budget(key, native, reserved)
                     if mark == KeyStatus.rate_limited:
                         mark_account_rate_limited(key.provider_id, key.account_label)  # 账号短路：同账号 TPM 冷却
                         await mark_key_model_status(db, key_id=key.id, provider_id=tier.provider_id, model_name=native, status=mark, message=msg)
@@ -418,6 +523,7 @@ async def route_chat_completions(
                 continue  # 网络异常或可重试错误，换下一个 key
             # 200：流已打开，故障转移窗口关闭
             await _revive_if_exhausted(key, db)
+            reset_account_backoff(key.provider_id, key.account_label)
             meta = {
                 "channel_id": channel.id,
                 "tier_order": tier.order,
@@ -427,8 +533,8 @@ async def route_chat_completions(
                 "native_model": native,
                 "t0": t0,
                 "account_label": key.account_label,
-                "est_tokens": est_tokens,
-                "tpm_consumed": acquired,  # True=已预扣 TPM; False=顾问放行未预扣
+                "est_tokens": reserved,  # 已乘预估校准系数，结算时用同口径
+                "est_base": est_tokens,  # 未乘系数的原始预估，用于更新校准系数
             }
             return StreamingResponse(
                 _stream_passthrough(client, response, meta), media_type="text/event-stream"
@@ -439,17 +545,20 @@ async def route_chat_completions(
                     resp = await _send_with_retry(client, url, headers=_headers(raw), json=payload)
             except Exception as e:
                 last_error = f"{type(e).__name__}: {e}"
+                _refund_budget(key, native, reserved)
                 continue
             latency_ms = int((time.time() - t0) * 1000)
             if resp.status_code == 200:
                 data = resp.json()
                 await _revive_if_exhausted(key, db)
-                # TPM 事后修正：按实际 usage 调整账号 TPM 桶
+                reset_account_backoff(key.provider_id, key.account_label)
+                # TPM 结算：把窗口里的预估值替换成实际 usage，并据此校准预估系数
                 _usage = data.get("usage")
                 if _usage:
                     _actual = (_usage.get("prompt_tokens", 0) or 0) + (_usage.get("completion_tokens", 0) or 0)
-                    tpm_correct(key.provider_id, key.account_label, native,
-                                est_tokens if acquired else 0, _actual)
+                    tpm_settle(key.provider_id, key.account_label, native, reserved, _actual)
+                    _update_est_factor(native, est_tokens, _actual)
+                # 无 usage 时保留预留值（请求确实消耗了 token，按估算记账比退回更保守）
                 await write_call_log(
                     channel_id=channel.id,
                     tier_order=tier.order,
@@ -465,7 +574,17 @@ async def route_chat_completions(
                 )
                 return JSONResponse(status_code=200, content=data)
             retry, mark, msg = classify_error(resp.status_code, resp.text)
+            log.info("upstream_error_classified",
+                     channel_id=channel.id, key_id=key.id,
+                     provider_id=tier.provider_id,
+                     virtual_model=virtual, native_model=native,
+                     http_status=resp.status_code,
+                     error_code=extract_error_code(resp.text),
+                     mark=mark.value if mark else None, retry=retry)
             _is_model_quota = is_model_pool_quota(resp.text) or "entitlement" in (resp.text or "").lower()
+            if resp.status_code == 429:
+                tpm_on_rate_limit(key.provider_id, key.account_label, native, reserved)
+            _refund_budget(key, native, reserved)
             if mark == KeyStatus.rate_limited:
                 mark_account_rate_limited(key.provider_id, key.account_label)  # 账号短路：同账号 TPM 冷却
                 await mark_key_model_status(db, key_id=key.id, provider_id=tier.provider_id, model_name=native, status=mark, message=msg)
@@ -506,6 +625,40 @@ async def route_chat_completions(
                 status_code=resp.status_code,
                 content={"error": {"message": msg, "type": "upstream_error"}},
             )
+
+    # 全部尝试失败。若失败原因是限流且所有账号现在都在冷却中，返回 429 而非 502：
+    # 502 会让客户端当成"网关故障"立刻猛重试，429 + 真实 Retry-After 才是正确信号。
+    # （同一请求内 6 个账号被逐个打冷后尚未重新进入 attempt 循环，短路检查来不及生效。）
+    cooldown = max(
+        (account_rate_limited_remaining(k.provider_id, k.account_label) for _, k in attempts),
+        default=0.0,
+    )
+    if cooldown > 0 and last_error.startswith("HTTP 429"):
+        secs = ceil_div_seconds(cooldown)
+        log.info("all_failed_accounts_cooling_429", channel_id=channel.id,
+                 virtual_model=virtual, retry_after_s=secs)
+        return JSONResponse(
+            status_code=429,
+            headers={"Retry-After": str(secs)},
+            content={"error": {
+                "message": f"上游账号均已限流，请 {secs} 秒后重试",
+                "type": "rate_limited",
+            }},
+        )
+
+    if budget_blocked_wait is not None:
+        # 有候选 key 但全部被 TPM 预算挡住（走到这里说明等待也没等到）。
+        secs = ceil_div_seconds(budget_blocked_wait)
+        log.info("tpm_budget_blocked_429", channel_id=channel.id,
+                 virtual_model=virtual, wait_s=round(budget_blocked_wait, 1))
+        return JSONResponse(
+            status_code=429,
+            headers={"Retry-After": str(secs)},
+            content={"error": {
+                "message": f"本分钟 token 预算不足，请 {secs} 秒后重试",
+                "type": "rate_limited",
+            }},
+        )
 
     log.warning(
         "all_upstreams_failed",
@@ -548,15 +701,18 @@ async def _stream_passthrough(client: httpx.AsyncClient, response: httpx.Respons
             pass
         await client.aclose()
         latency_ms = int((time.time() - meta["t0"]) * 1000)
-        # TPM 事后修正：按实际 usage 调整账号 TPM 桶
+        # TPM 结算：流正常结束且有 usage 时按实际值覆盖预留并校准预估；
+        # 流中途断了则退回预留（没真正消耗完，不该占用预算）。
+        _reserved = meta.get("est_tokens", 0)
+        _native = meta["native_model"]
+        _pid = meta["provider_id"]
+        _acct = meta.get("account_label")
         if usage:
             actual = (usage.get("prompt_tokens", 0) or 0) + (usage.get("completion_tokens", 0) or 0)
-            tpm_correct(
-                meta["provider_id"], meta.get("account_label"),
-                meta["native_model"],
-                meta.get("est_tokens", 0) if meta.get("tpm_consumed") else 0,
-                actual,
-            )
+            tpm_settle(_pid, _acct, _native, _reserved, actual)
+            _update_est_factor(_native, int(meta.get("est_base", 0)), actual)
+        elif status == "error":
+            tpm_release(_pid, _acct, _native, _reserved)
         # 用独立任务写日志：即使客户端中途断开导致生成器被取消，日志也能落库
         asyncio.create_task(
             write_call_log(
@@ -599,7 +755,7 @@ async def route_embeddings(channel: Channel, body: dict, db: AsyncSession) -> JS
             continue  # 模型池冷却：该 key 上本模型的积分池刚报 429
         native = await resolve_native(virtual, tier.provider_id, db)
         # 令牌桶事前控速：该 key+模型无令牌时跳过，换下一把 key（多密钥池自动负载）
-        if not acquire_token(key.id, native):
+        if not acquire_rpm(key.id, native):
             continue
         base = base_url_for(tier.provider)
         if not base:
@@ -777,7 +933,7 @@ async def route_image_generations(
             continue
         native = await resolve_native(virtual, tier.provider_id, db)
         # 令牌桶事前控速：该 key+模型无令牌时跳过，换下一把 key
-        if not acquire_token(key.id, native):
+        if not acquire_rpm(key.id, native):
             continue
         base = base_url_for(tier.provider)
         if not base:

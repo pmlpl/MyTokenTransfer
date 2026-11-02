@@ -233,16 +233,18 @@ npm run preview    # 预览构建产物
 
 `backend/.env`（本地进程运行时，示例见 `backend/.env.example`）：`DATABASE_URL`、`MASTER_PASSWORD`、`SECRET_KEY`、`GATEWAY_TOKEN`、`ENCRYPTION_KEY`、`SESSION_MAX_AGE`、`CORS_ORIGINS`。
 
-代码里可直接读到的**运行期**环境变量（`os.environ`，未进 `.env.example`）：
+代码里可直接读到的**运行期**环境变量（未写进根 `.env` 时取代码默认值；也可写进 `backend/.env`，模块会回退读取）：
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `MTT_TOKEN_BUCKET_RPM` | `20` | 每把 key 每分钟请求数上限（RPM 桶补充速率） |
 | `MTT_TOKEN_BUCKET_BURST` | `10` | RPM 突发容量（桶满时可连发几个请求） |
 | `MTT_TOKEN_BUCKET_MODEL_RPM` | 空 | 按原生模型名覆盖 RPM，格式 `deepseek-flash:5` |
-| `MTT_TOKEN_BUCKET_TPM` | `30000` | 每账号每分钟 token 上限（TPM 桶，0=关闭仅用 RPM） |
-| `MTT_TOKEN_BUCKET_TPM_BURST_RATIO` | `0.5` | TPM 突发容量比例（burst = TPM × ratio） |
-| `MTT_TOKEN_BUCKET_MODEL_TPM` | 空 | 按原生模型名覆盖 TPM，格式 `deepseek-flash:10000` |
+| `MTT_TOKEN_BUCKET_TPM` | `400000` | TPM 预算**种子**（自适应起点，非硬上限；`0`=关闭 TPM） |
+| `MTT_TOKEN_BUCKET_TPM_MIN` | `50000` | 自适应预算下限（防 429 把预算压到发不出正常请求） |
+| `MTT_TOKEN_BUCKET_TPM_MAX` | `4000000` | 自适应预算上限 |
+| `MTT_TOKEN_BUCKET_TPM_MAX_WAIT` | `8` | 预算不足时最多等待秒数，超过直接 429 + 精确 Retry-After |
+| `MTT_TOKEN_BUCKET_MODEL_TPM` | 空 | 按原生模型名覆盖预算种子，格式 `glm-5.2:800000` |
 
 生成随机凭据的参考做法：
 
@@ -379,13 +381,14 @@ Base URL: http://<Tailscale-IP>:<WEB_PORT>/v1     # 管理台 Playground 页的�
 1. **正常路径**：`active` 密钥；限流冷却到期的直接视为可用（省一个巡检周期）。per-model `rate_limited` 冷却过期后同样立即回池（fast-path），不等巡检。
 2. **全池 exhausted**：追加最久未测的 `exhausted` 密钥，赌额度窗口已滚动恢复（`exhausted` 复测周期 **10 分钟**）。
 3. **模型池冷却**：同一把 key 上某模型积分池 429 只冷却 **(key, 模型) 组合 300 秒**，不标死整把 key；全组合冷却时追加冷却组合做最后尝试。
-4. **账号 TPM 冷却**：高并发打满共享 TPM → 同账号 **60 秒**冷却，全池冷却时无视冷却取层内密钥试最后一轮。
-5. **冷却短路**：④ 构建后如果全部候选都在账号冷却中，**直接返回 429 + `Retry-After: 60`**，不走 for 循环——避免对冷却中的 key 串行发 doomed 请求导致 502 延迟 30-40s 和冷却被反复重置。
+4. **账号速率冷却（阶梯退避）**：高并发打满共享 TPM → 同账号冷却，连续限流时按 **60 → 120 → 300 → 600 → 900 秒** 逐级拉长，任意一次成功调用清零阶梯；全池冷却时无视冷却取层内密钥试最后一轮。
+5. **冷却短路**：④ 构建后如果全部候选都在账号冷却中，**直接返回 429 + `Retry-After: <真实剩余秒数>`**，不走 for 循环——避免对冷却中的 key 串行发 doomed 请求导致 502 延迟 30-40s 和冷却被反复重置。
 
 补充行为：
 
 - 网络层瞬时故障（TLS 被掐 / 连接重置）**原地重试 3 次**（退避 1s）；最后尝试拿到 200 即把密钥自动拉回 `active` 并 resolve 告警。
-- **双层令牌桶事前控速**：发出请求前先检查 RPM 桶（按 key 扣 1）和 TPM 桶（按预估 token 数扣，响应后按实际 usage 修正）。无令牌直接换下一把 key；**永不硬失败**——全部 key 都无令牌时顾问放行。
+- **RPM 桶事前控速**：按 (key, 原生模型) 每请求扣 1，桶空换下一把 key。
+- **TPM 滚动窗口 + 自适应预算**：按 (账号, 原生模型) 记最近 60 秒已用 token，窗口内已用 + 本次预估 ≤ 预算才放行；放不下就先**短暂等待**（≤ `TPM_MAX_WAIT`，默认 8 秒）再试，等不及则返回 429 + 精确 `Retry-After`。预算随上游反馈自动学习（成功则至少抬到容得下这条请求；窗口消耗过半仍吃 429 则乘性下调；窗口很空却 429 就按并发案处理、不动预算）。失败请求**退回预留**，不白占预算。
 - **非 active 密钥探测保护期 5 分钟**：刚被判 degraded 的 key，小探针能过但大请求仍可能限流，保护期内探测成功不恢复 `active`，避免状态横跳。
 - **定时巡检**（APScheduler）：每 **10 分钟**重测所有非 `active` 且非 `disabled` 的密钥；每日 **02:30** 预聚合 rollup；启动时回填近 **60 天** 用量。
 

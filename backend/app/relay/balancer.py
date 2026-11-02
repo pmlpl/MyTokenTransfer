@@ -33,13 +33,53 @@ _RATE_LIMIT_COOLDOWN = 60
 # account_label 为 None 的 key 视为同源（未标注账号时保守地共享冷却）。
 _account_rate_limited_until: dict[tuple[int, str | None], datetime] = {}
 
+# 连续限流退避阶梯（秒）：同一账号连续被 429 时逐级拉长冷却。
+# 固定 60 秒的问题：持续限流场景下网关每分钟原样重试全池 key，
+# 每次都撞 429 又重置计时器，客户端侧表现为"一直在重试"。
+# 任意一次成功调用（reset_account_backoff）把阶梯清零。
+_BACKOFF_STEPS = (60, 120, 300, 600, 900)
+_account_backoff_level: dict[tuple[int, str | None], int] = {}
+
 
 def mark_account_rate_limited(provider_id: int, account_label: str | None,
-                              cooldown: int = _RATE_LIMIT_COOLDOWN) -> None:
-    """标记某账号处于速率限制冷却期（同账号密钥共享上游 TPM，一个限流全限流）。"""
-    _account_rate_limited_until[(provider_id, account_label)] = now_utc() + timedelta(seconds=cooldown)
+                              cooldown: int | None = None) -> None:
+    """标记某账号处于速率限制冷却期，连续限流时按阶梯退避。
+
+    阶梯只在**同一账号冷却已到期后再次被限流**时升一级。并发突发场景下
+    8 个请求同一秒各自收到 429，若每个 429 都升级，阶梯会从 60 直接跳到
+    900（实测发生过）——把可恢复的分钟级限流误判成 15 分钟。
+    一个限流"事件"只计一级：仍在冷却中收到的 429 视为同一次事件。
+
+    cooldown 显式传入时不走退避（健康探测等场景需要固定时长）。
+    """
+    acquired = (provider_id, account_label)
+    if cooldown is None:
+        # 仍在冷却期 → 同一波突发，不升级；只把到期时间刷新为当前档位
+        still_cooling = account_is_rate_limited(provider_id, account_label)
+        if not still_cooling:
+            level = _account_backoff_level.get(acquired, 0)
+            cooldown = _BACKOFF_STEPS[min(level, len(_BACKOFF_STEPS) - 1)]
+            _account_backoff_level[acquired] = level + 1
+        else:
+            level = max(0, _account_backoff_level.get(acquired, 1) - 1)
+            cooldown = _BACKOFF_STEPS[min(level, len(_BACKOFF_STEPS) - 1)]
+    _account_rate_limited_until[acquired] = now_utc() + timedelta(seconds=cooldown)
     log.warning("account_rate_limited", provider_id=provider_id,
-                account_label=account_label, cooldown_sec=cooldown)
+                account_label=account_label, cooldown_sec=cooldown,
+                level=_account_backoff_level.get(acquired, 0))
+
+
+def reset_account_backoff(provider_id: int, account_label: str | None) -> None:
+    """账号调用成功：清零退避阶梯，下次限流重新从 60 秒起步。"""
+    acquired = (provider_id, account_label)
+    if _account_backoff_level.pop(acquired, 0):
+        log.info("account_backoff_reset", provider_id=provider_id,
+                 account_label=account_label)
+
+
+def account_backoff_level(provider_id: int, account_label: str | None) -> int:
+    """当前退避阶梯（0 = 未连续限流）。"""
+    return _account_backoff_level.get((provider_id, account_label), 0)
 
 
 def account_is_rate_limited(provider_id: int, account_label: str | None) -> bool:

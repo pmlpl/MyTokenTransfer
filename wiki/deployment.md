@@ -236,18 +236,20 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 
 `core/config.py` 用 `extra="ignore"`，所以 `.env` 里多写的键不会报错（这也是 `REDIS_URL` 被静默忽略的原因）。
 
-### 运行期环境变量（`os.environ`，未进 `.env.example`）
+### 运行期环境变量
 
 | 变量 | 默认 | 说明 | 代码 |
 | --- | :---: | --- | --- |
 | `MTT_TOKEN_BUCKET_RPM` | `20` | 每把 key 每分钟请求上限（RPM 桶） | `relay/token_bucket.py` |
 | `MTT_TOKEN_BUCKET_BURST` | `10` | RPM 突发容量 | 同上 |
 | `MTT_TOKEN_BUCKET_MODEL_RPM` | 空 | 按原生模型名覆盖 RPM，格式 `deepseek-flash:5` | 同上 |
-| `MTT_TOKEN_BUCKET_TPM` | `30000` | 每账号每分钟 token 上限（TPM 桶，0=关闭） | 同上 |
-| `MTT_TOKEN_BUCKET_TPM_BURST_RATIO` | `0.5` | TPM 突发容量比例（burst = TPM × ratio） | 同上 |
-| `MTT_TOKEN_BUCKET_MODEL_TPM` | 空 | 按原生模型名覆盖 TPM，格式 `deepseek-flash:10000` | 同上 |
+| `MTT_TOKEN_BUCKET_TPM` | `400000` | TPM 预算种子（自适应起点；0=关闭） | 同上 |
+| `MTT_TOKEN_BUCKET_TPM_MIN` | `50000` | 预算下限 | 同上 |
+| `MTT_TOKEN_BUCKET_TPM_MAX` | `4000000` | 预算上限 | 同上 |
+| `MTT_TOKEN_BUCKET_TPM_MAX_WAIT` | `8` | 预算不足时最多等待秒数 | 同上 |
+| `MTT_TOKEN_BUCKET_MODEL_TPM` | 空 | 按原生模型名覆盖预算种子，格式 `glm-5.2:800000` | 同上 |
 
-> 想调令牌桶就得在 compose 的 `backend.environment` 里加这几项（或本地 shell 里 `export`），因为 compose 默认不注入它们。
+> 这些变量 `docker-compose.yml` 的 `backend.environment` 已全部注入（`${...:-默认值}`，不填就用括号里的默认）。本地直跑 uvicorn 时也可写进 `backend/.env`——`token_bucket.py` 在 `os.environ` 缺失时会回退读该文件。
 
 ## 8. 数据库运维
 

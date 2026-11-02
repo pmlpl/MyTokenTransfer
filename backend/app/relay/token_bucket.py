@@ -1,89 +1,168 @@
-"""令牌桶限流：按 (key_id, native_model) 维度事前控速。
+"""令牌桶限流：双层事前控速。
 
-双层令牌桶：
-- RPM 桶（按 key×模型）：每分钟请求数，扣 1 个令牌/请求
-- TPM 桶（按 账号×模型）：每分钟 token 数，按预估 token 数扣减
+两家维度完全不同的限速机制：
 
-TPM 桶解决 DeepSeek-Flash 等快生成模型的问题：单次请求可烧上万
-token，RPM 桶只扣 1 无法感知，导致 TPM 配额在上游被打满后才开始
-事后冷却。TPM 桶在请求发出前就按预估消耗量扣减，桶空则换有余量的
-账号，从源头减少注定 429 的请求。
+- **RPM 桶**（按 key×模型）：每分钟请求数，扣 1 个令牌/请求。
+  经典令牌桶，桶空即换下一把 key。
 
-与现有"事后冷却"（mark_model_quota_limited / key_model_statuses）互补：
-- 事后冷却：已经被上游 429 后才标记，冷却期内跳过
-- 令牌桶：请求发出前检查速率，无令牌则换下一把 key，从源头减少 429
+- **TPM 预算**（按 账号×模型）：每分钟 token 数。
+  不是令牌桶——因为单次 agent 请求可达数十万 token，比"每分钟额度"
+  本身还大，令牌桶的 burst 容量再调也装不下一条请求，于是恒空、
+  恒走放行、恒由事后补扣兜底，等于完全失效。改为**滚动 60 秒窗口记账
+  + 自适应预算**：窗口内已用 token 之和逼近预算就等它滚出窗口，
+  等不及则明确返回 429 + 精确 Retry-After，而不是把请求发出去撞 429。
+
+  预算本身由上游反馈自动学习（AIMD）：
+  - 一条请求成功 → 说明预算至少这么大，立即抬到 actual × 1.15
+  - 慢速探测：每若干次成功轻微上调
+  - 窗口消耗过半仍吃 429 → 乘性下调（有冷却，避免震荡）
+  - 窗口消耗很低却吃 429 → 大概率是并发/RPM 限制，不动预算
 
 设计原则：
 1. 单进程 uvicorn，无锁（事件循环内无 await 的算术操作不存在竞态）
-2. 令牌桶永不导致硬失败——全部 key 无令牌时由 gateway 顾问放行（不硬阻）
-3. 速率可按模型覆盖，默认值保守（免费层远低于官方 5 RPS 上限）
-4. TPM 预估是粗估（prompt 字符数/3 + max_tokens），响应返回后按
-   实际 usage 修正，避免长期偏差
+2. 不硬阻：预算不够先短暂等待，等不及才返回 429（带真实等待秒数）
+3. 速率可按模型覆盖；`MTT_TOKEN_BUCKET_TPM=0` 一键关闭 TPM 追踪
+4. 预估是粗估，成功路径用实际 usage 结算覆盖预留值，失败路径退回预留
 """
 from __future__ import annotations
 
+import math
 import os
 import time
+from collections import deque
+from pathlib import Path
 
 import structlog
 
 log = structlog.get_logger("relay")
 
-# ── 速率配置 ──────────────────────────────────────────────────────────
+
+def _env_int(name: str, default: int) -> int:
+    """读整型环境变量，缺失时回退读 backend/.env。
+
+    pydantic-settings 只把 .env 读进 Settings 对象，不会写 os.environ，
+    所以令牌桶这类直接用 os.environ 的模块在本地直跑时读不到 .env。
+    这里补一层回退，让「把 MTT_* 写进 backend/.env」也能生效。
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        raw = _read_dotenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw.strip())
+    except (ValueError, AttributeError):
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        raw = _read_dotenv(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw.strip())
+    except (ValueError, AttributeError):
+        return default
+
+
+def _env_str(name: str, default: str) -> str:
+    raw = os.environ.get(name)
+    if raw is None:
+        raw = _read_dotenv(name)
+    return default if raw is None else raw.strip()
+
+
+def _read_dotenv(name: str) -> str | None:
+    """从 backend/.env 读一个键（仅本模块使用的兜底通道）。"""
+    path = Path(__file__).resolve().parents[2] / ".env"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        if key.strip() == name:
+            return val.strip().strip('"').strip("'")
+    return None
+
+
+# ── RPM（每分钟请求数）──────────────────────────────────────────────
 # 默认每把 key 每分钟请求数（RPM）。保守值：免费层避免触发 "429 rpm exhausted"。
 # 官方接口上限 5 RPS = 300 RPM，免费层实际 RPM 限额未公布，取 20 留足余量。
-_DEFAULT_RPM = int(os.environ.get("MTT_TOKEN_BUCKET_RPM", "20"))
+_DEFAULT_RPM = _env_int("MTT_TOKEN_BUCKET_RPM", 20)
 
 # 突发容量：桶满时允许连续发出的请求数（不用等补充）。
-_DEFAULT_BURST = int(os.environ.get("MTT_TOKEN_BUCKET_BURST", "10"))
+_DEFAULT_BURST = _env_int("MTT_TOKEN_BUCKET_BURST", 10)
+
+
+def _parse_model_overrides(raw: str) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for pair in raw.split(","):
+        pair = pair.strip()
+        if ":" in pair:
+            name, val = pair.split(":", 1)
+            try:
+                out[name.strip()] = int(val.strip())
+            except ValueError:
+                pass
+    return out
+
 
 # 按原生模型名覆盖 RPM，格式："glm-5.2:10,deepseek-v4-flash:15"
-_MODEL_RPM_ENV = os.environ.get("MTT_TOKEN_BUCKET_MODEL_RPM", "")
-_MODEL_RPM_OVERRIDES: dict[str, int] = {}
-for pair in _MODEL_RPM_ENV.split(","):
-    pair = pair.strip()
-    if ":" in pair:
-        name, val = pair.split(":", 1)
-        try:
-            _MODEL_RPM_OVERRIDES[name.strip()] = int(val.strip())
-        except ValueError:
-            pass
+_MODEL_RPM_OVERRIDES = _parse_model_overrides(
+    _env_str("MTT_TOKEN_BUCKET_MODEL_RPM", "")
+)
 
 
 def _rpm_for(model_name: str) -> int:
     return _MODEL_RPM_OVERRIDES.get(model_name, _DEFAULT_RPM)
 
 
-# ── TPM（每分钟 token 数）配置 ──────────────────────────────────────
-# 上游按账号×模型限 TPM（tokens per minute）。DeepSeek 等快生成模型
-# 单次请求可烧上万 token，RPM 桶无法感知 → 需要按 token 消耗控速。
-# 0 = 关闭 TPM 追踪（仅用 RPM，向后兼容）。
-# 商汤 SenseNova 的 TPM 上限未公开（登录后才可见），取 30000 留余量：
-# GLM-5.2 正常 agent 用量远低于此值不受影响；DeepSeek-Flash 可按需调低。
-_DEFAULT_TPM = int(os.environ.get("MTT_TOKEN_BUCKET_TPM", "30000"))
+# ── TPM（每分钟 token 数）预算配置 ──────────────────────────────────
+# 种子值：仅作自适应起点，不是硬上限。实测单次 agent 请求可达 33 万 token
+# （长会话整段历史每次全带上），旧的 30000 令牌桶容量 15000 装不下任何一条
+# 真实请求，导致 TPM 层从未生效。
+_TPM_SEED = _env_int("MTT_TOKEN_BUCKET_TPM", 400_000)
 
-# TPM 突发容量比例：桶满时允许一次性消耗的 token 数占 TPM 的比例。
-# 0.5 = 15000（对 30000 TPM），允许 2-3 次大请求后开始节流。
-_DEFAULT_TPM_BURST_RATIO = float(os.environ.get("MTT_TOKEN_BUCKET_TPM_BURST_RATIO", "0.5"))
+# 预算上下限。下限防止 429 把预算压到发不出正常请求；
+# 上限防止某次异常大头把预算永久抬高。
+_TPM_FLOOR = _env_int("MTT_TOKEN_BUCKET_TPM_MIN", 50_000)
+_TPM_CEIL = _env_int("MTT_TOKEN_BUCKET_TPM_MAX", 4_000_000)
 
-# 按原生模型覆盖 TPM，格式："deepseek-flash:10000,glm-5.2:60000"
-_MODEL_TPM_ENV = os.environ.get("MTT_TOKEN_BUCKET_MODEL_TPM", "")
-_MODEL_TPM_OVERRIDES: dict[str, int] = {}
-for pair in _MODEL_TPM_ENV.split(","):
-    pair = pair.strip()
-    if ":" in pair:
-        name, val = pair.split(":", 1)
-        try:
-            _MODEL_TPM_OVERRIDES[name.strip()] = int(val.strip())
-        except ValueError:
-            pass
+# 预算不足时最多等待多少秒再重发；超过则直接 429。
+_TPM_MAX_WAIT = _env_float("MTT_TOKEN_BUCKET_TPM_MAX_WAIT", 8.0)
+
+# 窗口长度：与上游 TPM 口径一致（每分钟）。
+_TPM_WINDOW_SEC = 60.0
+
+# 乘性下调系数 / 上调系数
+_TPM_DECREASE_FACTOR = 0.6
+_TPM_INCREASE_FACTOR = 1.15
+_TPM_PROBE_FACTOR = 1.02
+_TPM_PROBE_EVERY = 10  # 每 N 次成功做一次慢速上调
+
+# 两次下调之间的最短间隔（秒）：防止连发 429 把预算瞬间砸到地板。
+_TPM_DECREASE_COOLDOWN = 30.0
+
+# 只有窗口消耗达到预算该比例时才认为"是 TPM 打满"，才调预算。
+_TPM_DECREASE_THRESHOLD = 0.5
+
+# 按原生模型覆盖种子，格式："deepseek-flash:100000,glm-5.2:800000"
+_MODEL_TPM_OVERRIDES = _parse_model_overrides(
+    _env_str("MTT_TOKEN_BUCKET_MODEL_TPM", "")
+)
 
 
-def _tpm_for(model_name: str) -> int:
-    return _MODEL_TPM_OVERRIDES.get(model_name, _DEFAULT_TPM)
+def _tpm_seed_for(model_name: str) -> int:
+    return _MODEL_TPM_OVERRIDES.get(model_name, _TPM_SEED)
 
 
-# ── 令牌桶 ────────────────────────────────────────────────────────────
+# ── RPM 令牌桶 ────────────────────────────────────────────────────────
 class _Bucket:
     __slots__ = ("capacity", "last_refill", "rate", "tokens")
 
@@ -108,21 +187,8 @@ class _Bucket:
             return True
         return False
 
-    def try_consume(self, n: float) -> bool:
-        """尝试消耗 n 个令牌（用于 TPM：按 token 数扣减）。"""
-        self._refill()
-        if self.tokens >= n:
-            self.tokens -= n
-            return True
-        return False
-
-    def deduct(self, n: float) -> None:
-        """无条件扣减（事后修正：实际消耗 > 预估时补扣）。可为负。"""
-        self._refill()
-        self.tokens -= n
-
     def refund(self, n: float = 1.0) -> None:
-        """退还令牌（事后修正：实际消耗 < 预估时回退，不超容量）。"""
+        """退还令牌（失败请求回收），不超容量。"""
         self._refill()
         self.tokens = min(self.capacity, self.tokens + n)
 
@@ -130,13 +196,6 @@ class _Bucket:
         """当前可用令牌数（含应补充未补充的）。"""
         self._refill()
         return self.tokens
-
-    def seconds_until(self, tokens: float = 1.0) -> float:
-        """还需多少秒才能攒够指定令牌数（用于等待决策）。"""
-        self._refill()
-        if self.tokens >= tokens:
-            return 0.0
-        return (tokens - self.tokens) / self.rate if self.rate > 0 else float("inf")
 
 
 # 全局桶注册表：(key_id, native_model) -> _Bucket
@@ -155,100 +214,270 @@ def _get_bucket(key_id: int, model_name: str) -> _Bucket:
     return bucket
 
 
-def acquire_token(
-    key_id: int,
-    model_name: str,
-    est_tokens: int = 0,
-    provider_id: int = 0,
-    account_label: str | None = None,
-) -> bool:
-    """尝试为 (key_id, model_name) 获取令牌（RPM + 可选 TPM）。
+def acquire_rpm(key_id: int, model_name: str) -> bool:
+    """只扣 RPM 令牌（embeddings / images 等无 token 语义的接口用）。"""
+    return _get_bucket(key_id, model_name).acquire()
 
-    est_tokens>0 时额外检查账号级 TPM 桶：按预估 token 数扣减，
-    桶空则退还已扣的 RPM 令牌并返回 False（跳过此 key，换有余量的账号）。
-    est_tokens=0 时仅检查 RPM（向后兼容 embeddings/images）。
 
-    返回 True 表示已消耗令牌、可以发请求；
-    返回 False 表示桶空、应跳过此 key 换下一把。
-    """
-    rpm_bucket = _get_bucket(key_id, model_name)
-    if not rpm_bucket.acquire():
-        return False
-    if est_tokens > 0:
-        tpm_bucket = _get_tpm_bucket(provider_id, account_label, model_name)
-        if tpm_bucket is not None and not tpm_bucket.try_consume(float(est_tokens)):
-            rpm_bucket.refund(1.0)  # TPM 不够，退还已扣的 RPM 令牌
-            return False
-    return True
+def release_rpm(key_id: int, model_name: str) -> None:
+    """退还一个 RPM 令牌（请求失败时调用）。"""
+    _get_bucket(key_id, model_name).refund(1.0)
 
 
 def available_tokens(key_id: int, model_name: str) -> float:
-    """查询当前可用令牌数（不消耗）。用于日志/调试。"""
+    """查询当前可用 RPM 令牌数（不消耗）。用于日志/调试。"""
     return _get_bucket(key_id, model_name).available()
 
 
-def wait_seconds_for_any(key_ids: list[int], model_name: str) -> float:
-    """给定一组 key，返回任意一把攒够 1 个令牌所需的最短秒数。
+# ── TPM 滚动窗口 + 自适应预算 ────────────────────────────────────────
+class _TpmState:
+    """一个 (账号, 模型) 的 TPM 记账状态。
 
-    用于 gateway 在全部 key 桶空时决定等待多久。
+    window 存 (monotonic_ts, tokens)，只保留最近 60 秒内的条目。
+    每次操作前先 prune，窗口和即为"本分钟已用"。
     """
-    if not key_ids:
-        return 0.0
-    return min(_get_bucket(kid, model_name).seconds_until(1.0) for kid in key_ids)
+
+    __slots__ = ("budget", "window", "last_decrease_at", "successes", "seed",
+                 "floor", "provider_id", "account_label", "model")
+
+    def __init__(self, seed: int, provider_id: int = 0,
+                 account_label: str | None = None, model: str = ""):
+        self.seed = float(seed)
+        self.floor = float(max(_TPM_FLOOR, int(seed * 0.1)))
+        self.budget = float(max(self.floor, min(_TPM_CEIL, seed)))
+        self.window: deque[tuple[float, float]] = deque()
+        self.last_decrease_at = 0.0
+        self.successes = 0
+        # 身份标识：每条预算调整日志都要能定位到具体账号，否则多账号并发时
+        # 日志里只有孤零零的数字，无法判断是哪个账号在降/在升。
+        self.provider_id = provider_id
+        self.account_label = account_label
+        self.model = model
+
+    def _log_ctx(self) -> dict:
+        return {
+            "provider_id": self.provider_id,
+            "account_label": self.account_label,
+            "model": self.model,
+        }
+
+    def _prune(self, now: float) -> None:
+        while self.window and now - self.window[0][0] >= _TPM_WINDOW_SEC:
+            self.window.popleft()
+
+    def spent(self) -> float:
+        now = time.monotonic()
+        self._prune(now)
+        return sum(t for _, t in self.window)
+
+    def _would_fit(self, est: float) -> bool:
+        return self.spent() + est <= self.budget
+
+    def wait_seconds(self, est: float) -> float:
+        """窗口放开 est 需要等多久（秒）；0 表示可以立即放行。
+
+        单条请求比整个预算还大时，只有窗口完全空才能放行——否则这条
+        请求永远发不出去。此时等到窗口清空即可。
+        """
+        now = time.monotonic()
+        self._prune(now)
+        if not self.window:
+            return 0.0
+        if self._would_fit(est):
+            return 0.0
+        # 需要让最老的条目滚出窗口，腾出足够空间
+        need_to_free = self.spent() + est - self.budget
+        freed = 0.0
+        for ts, toks in self.window:
+            freed += toks
+            if freed >= need_to_free:
+                return max(0.0, _TPM_WINDOW_SEC - (now - ts))
+        # 极端情况：整窗全滚空也不够（est > budget），等窗口清空
+        return max(0.0, _TPM_WINDOW_SEC - (now - self.window[0][0]))
+
+    def reserve(self, est: float) -> tuple[bool, float]:
+        wait = self.wait_seconds(est)
+        if wait > 0.0:
+            return False, wait
+        self.window.append((time.monotonic(), float(est)))
+        return True, 0.0
+
+    def settle(self, reserved: float, actual: float) -> None:
+        """把最近一条预留额从 est 改记为实际消耗。"""
+        now = time.monotonic()
+        self._prune(now)
+        for i in range(len(self.window) - 1, -1, -1):
+            ts, toks = self.window[i]
+            if toks == float(reserved):
+                self.window[i] = (ts, float(actual))
+                break
+        else:
+            # 找不到对应预留（被 prune 掉或已释放）：直接补记差额
+            delta = float(actual) - float(reserved)
+            if delta:
+                self.window.append((now, delta))
+
+    def release(self, reserved: float) -> None:
+        """退回一条预留（请求根本没发出去或失败）。"""
+        now = time.monotonic()
+        self._prune(now)
+        for i in range(len(self.window) - 1, -1, -1):
+            ts, toks = self.window[i]
+            if toks == float(reserved):
+                del self.window[i]
+                return
+
+    def on_success(self, actual: float) -> None:
+        """成功调用：抬预算到至少容得下这条请求，并做慢速探测上调。"""
+        target = actual * _TPM_INCREASE_FACTOR
+        if target > self.budget:
+            self.budget = min(float(_TPM_CEIL), target)
+            log.info("tpm_budget_raised", **self._log_ctx(),
+                     budget=int(self.budget), actual=int(actual))
+        self.successes += 1
+        if self.successes % _TPM_PROBE_EVERY == 0:
+            self.budget = min(float(_TPM_CEIL), self.budget * _TPM_PROBE_FACTOR)
+
+    def on_rate_limit(self, est: float) -> None:
+        """收到 429：仅当窗口确实被打满时才乘性下调预算。"""
+        now = time.monotonic()
+        self._prune(now)
+        spent = self.spent()
+        if spent < self.budget * _TPM_DECREASE_THRESHOLD:
+            # 窗口很空却吃 429 → 极可能是并发/RPM 限制，不是 TPM；不动预算
+            return
+        if now - self.last_decrease_at < _TPM_DECREASE_COOLDOWN:
+            return
+        self.last_decrease_at = now
+        reduced = min(self.budget * _TPM_DECREASE_FACTOR, float(est) * 0.9)
+        self.budget = max(self.floor, reduced)
+        log.warning("tpm_budget_lowered", **self._log_ctx(),
+                    budget=int(self.budget), spent=int(spent), est=int(est))
 
 
-# ── TPM 令牌桶（按 账号×模型）──────────────────────────────────────
-# 同账号密钥共享上游 TPM 池（多数厂商按账号/组织限流），与 balancer 的
-# account_is_rate_limited 同口径。按 (provider_id, account_label, model) 标识。
-_tpm_buckets: dict[tuple[int, str | None, str], _Bucket] = {}
+_tpm_states: dict[tuple[int, str | None, str], _TpmState] = {}
 
 
-def _get_tpm_bucket(
+def _get_tpm_state(
     provider_id: int, account_label: str | None, model_name: str
-) -> _Bucket | None:
-    """获取或创建 TPM 桶。TPM=0（未配置）时返回 None，表示不追踪。"""
-    tpm = _tpm_for(model_name)
-    if tpm <= 0:
+) -> _TpmState | None:
+    """获取或创建 TPM 状态。种子 <= 0 时返回 None，表示不追踪。"""
+    seed = _tpm_seed_for(model_name)
+    if seed <= 0:
         return None
     bkey = (provider_id, account_label, model_name)
-    bucket = _tpm_buckets.get(bkey)
-    if bucket is None:
-        burst = max(1, int(tpm * _DEFAULT_TPM_BURST_RATIO))
-        bucket = _Bucket(rpm=tpm, capacity=burst)  # rate=tpm/60 tokens/sec
-        _tpm_buckets[bkey] = bucket
-        log.info("tpm_bucket_created", provider_id=provider_id,
+    state = _tpm_states.get(bkey)
+    if state is None:
+        state = _TpmState(seed, provider_id=provider_id,
+                          account_label=account_label, model=model_name)
+        _tpm_states[bkey] = state
+        log.info("tpm_state_created", provider_id=provider_id,
                  account_label=account_label, model=model_name,
-                 tpm=tpm, burst=burst)
-    return bucket
+                 budget=int(state.budget), floor=int(state.floor))
+    return state
 
 
-def tpm_available(
-    provider_id: int, account_label: str | None, model_name: str
-) -> float:
-    """当前可用 TPM 令牌数（不消耗）。gateway 用此判断是否有余量。"""
-    bucket = _get_tpm_bucket(provider_id, account_label, model_name)
-    if bucket is None:
-        return float("inf")  # TPM 未启用，视为无限余量
-    return bucket.available()
+def tpm_reserve(
+    provider_id: int, account_label: str | None, model_name: str, est: int
+) -> tuple[bool, float]:
+    """尝试为本请求预留 est 个 token。
+
+    返回 (是否放行, 需要等待的秒数)。放行时已记入窗口。
+    TPM 未启用时恒为 (True, 0.0)。
+    """
+    state = _get_tpm_state(provider_id, account_label, model_name)
+    if state is None:
+        return True, 0.0
+    allowed, wait = state.reserve(float(est))
+    if allowed:
+        log.debug("tpm_reserved", provider_id=provider_id,
+                  account_label=account_label, model=model_name,
+                  est=int(est), spent=int(state.spent()), budget=int(state.budget))
+    return allowed, wait
 
 
-def tpm_correct(
+def tpm_settle(
     provider_id: int,
     account_label: str | None,
     model_name: str,
-    estimated: int,
+    reserved: int,
     actual: int,
 ) -> None:
-    """响应返回后按实际 usage 修正 TPM 桶。
-
-    estimated=0 表示请求时未预扣（桶空顾问放行），按实际消耗补扣。
-    estimated>0 时按差额修正：实际 > 预估则补扣，实际 < 预估则退还。
-    """
-    bucket = _get_tpm_bucket(provider_id, account_label, model_name)
-    if bucket is None:
+    """成功响应后按实际 usage 结算：窗口里的预估值改为实际值。"""
+    state = _get_tpm_state(provider_id, account_label, model_name)
+    if state is None:
         return
-    diff = actual - estimated
-    if diff > 0:
-        bucket.deduct(float(diff))
-    elif diff < 0:
-        bucket.refund(float(-diff))
+    state.settle(float(reserved), float(actual))
+    state.on_success(float(actual))
+
+
+def tpm_release(
+    provider_id: int, account_label: str | None, model_name: str, reserved: int
+) -> None:
+    """请求失败（网络异常/非 200/参数错误）：退回预留额度。"""
+    state = _get_tpm_state(provider_id, account_label, model_name)
+    if state is None:
+        return
+    state.release(float(reserved))
+
+
+def tpm_on_rate_limit(
+    provider_id: int, account_label: str | None, model_name: str, est: int
+) -> None:
+    """上游返回 429：让预算按 AIMD 下调。"""
+    state = _get_tpm_state(provider_id, account_label, model_name)
+    if state is None:
+        return
+    state.on_rate_limit(float(est))
+
+
+def tpm_remaining(
+    provider_id: int, account_label: str | None, model_name: str
+) -> float:
+    """当前预算余量（不消耗）。TPM 未启用时返回 inf。"""
+    state = _get_tpm_state(provider_id, account_label, model_name)
+    if state is None:
+        return float("inf")
+    return max(0.0, state.budget - state.spent())
+
+
+def tpm_wait(
+    provider_id: int, account_label: str | None, model_name: str, est: int
+) -> float:
+    """放行 est 还需等待多少秒（0 = 现在就能放行）。只读，不记账。"""
+    state = _get_tpm_state(provider_id, account_label, model_name)
+    if state is None:
+        return 0.0
+    return state.wait_seconds(float(est))
+
+
+def tpm_snapshot() -> list[dict]:
+    """导出全部 TPM 状态，供运维日志/排查使用。"""
+    out: list[dict] = []
+    for (pid, acct, model), st in _tpm_states.items():
+        out.append({
+            "provider_id": pid,
+            "account_label": acct,
+            "model": model,
+            "budget": int(st.budget),
+            "spent": int(st.spent()),
+            "remaining": int(max(0.0, st.budget - st.spent())),
+            "floor": int(st.floor),
+            "successes": st.successes,
+        })
+    return out
+
+
+def reset_tpm_state() -> None:
+    """清空全部 TPM 状态（测试与配置热更用）。"""
+    _tpm_states.clear()
+
+
+def max_wait_seconds() -> float:
+    """预算不足时允许等待的上限（秒）。"""
+    return max(0.0, _TPM_MAX_WAIT)
+
+
+def ceil_div_seconds(wait: float) -> int:
+    """把等待秒数转成 Retry-After 用的整数秒（至少 1）。"""
+    return max(1, int(math.ceil(wait)))

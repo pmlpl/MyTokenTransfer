@@ -31,6 +31,25 @@
 
 ---
 
+## [未发布] — 2026-11-02
+
+**修复**
+
+- `fix(relay): TPM 令牌桶改为滚动 60 秒窗口 + 自适应预算，修复事前控速完全失效` — 旧实现 TPM=30000、burst 比例 0.5 → 桶容量 15000，而实测单次 agent 请求平均 33.6 万 prompt tokens（最大 96 万），`try_consume` 永远失败 → `any_tpm_headroom` 永远 False → 每个请求都走「顾问放行」→ 只剩事后补扣，桶被打成深负值。现改为按 (账号, 原生模型) 的滚动 60 秒窗口记账：窗口内已用 + 本次预估 ≤ 预算才放行；放不下则短暂等待（≤ `TPM_MAX_WAIT`，默认 8 秒）再试，等不及返回 429 + **精确 `Retry-After`**。
+- `feat(relay): TPM 预算 AIMD 自学习` — SenseNova 未公开 TPM 上限，故预算由上游反馈学习：成功则 `max(budget, actual × 1.15)`；每 10 次成功 ×1.02 慢速探测；429 且窗口消耗 ≥ 预算 50% 则 ×0.6（每 30 秒最多降一次）；窗口很空却 429 不动预算（多半是并发/RPM 限制，误降会震荡）。钳制在 `TPM_MIN`–`TPM_MAX`。
+- `fix(relay): 失败请求退回 TPM 预留与 RPM 令牌` — 此前 base_url 缺失 / 解密失败 / 网络异常 / 上游非 200 都不退预扣，失败请求持续抽干桶。现在这些路径全部 `_refund_budget()`。
+- `fix(balancer): 账号限流冷却改阶梯退避，止住「每 60 秒原样重试全池」` — 固定 60 秒冷却在持续限流场景下每分钟重试全池 key，每次撞 429 又重置计时器，客户端表现为"一直在重试"。改为 60 → 120 → 300 → 600 → 900 秒逐级拉长，任意一次成功调用 `reset_account_backoff()` 清零。
+- `fix(relay): 全账号冷却短路的 Retry-After 用真实剩余秒数` — 此前硬编码 `60`，退避到 15 分钟时提前重试只白挨一次 429。
+- `fix(relay): 错误分类优先用结构化 error.code` — SenseNova 把可恢复的分钟级限流包成 `429 {"message":"inference exceeds tpm/rpm limit","code":"insufficient_quota"}`，只看关键词会误判成额度耗尽。现在 `RateLimitExceeded.*` / `EndpointTPMExceeded` 等 code 直接判 `rate_limited`；额度类 code 需同时满足"正文无速率关键词"才判 `exhausted`。新增 `extract_error_code()`，并把解析出的 code 打进 `upstream_error_classified` 日志。
+- `feat(relay): 预估 token 按模型校准` — `prompt 字符数÷3` 对中文明显低估（一个汉字约 1 token）。按原生模型维护 `actual/预估` 的 EMA（钳制 0.5–5.0），下次预估乘上它。
+
+**工程**
+
+- `config: TPM 配置项补齐到 .env.example 与 docker-compose` — 新增 `MTT_TOKEN_BUCKET_TPM`（种子 40 万）/ `TPM_MIN` / `TPM_MAX` / `TPM_MAX_WAIT`，移除已无意义的 `TPM_BURST_RATIO`。`token_bucket.py` 在 `os.environ` 缺失时回退读 `backend/.env`，修掉「写进 backend/.env 不生效」的坑。
+- `test: 新增 test_token_bucket.py（20 例）` — 覆盖滚动窗口准入/等待秒数、超大单请求一次性放行、settle/release、AIMD 升降与上下限钳制；conftest 一并清理 TPM 状态与退避阶梯，避免跨用例串扰。全量 89 例通过。
+
+---
+
 ## [未发布] — 2026-09-24
 
 **新增**

@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from app.models.enums import KeyStatus
-from app.relay.errors import classify_error
+from app.relay.errors import classify_error, extract_error_code
 
 
 def test_auth_error_marks_invalid_and_retryable():
@@ -53,3 +53,51 @@ def test_400_bad_request_not_retryable():
     retry, mark, _ = classify_error(400, "invalid model")
     assert retry is False
     assert mark is None
+
+
+# ── 结构化 error code 优先 ──────────────────────────────────────────
+# 实测 SenseNova 把可恢复的分钟级限流包成
+#   429 {"message":"inference exceeds tpm/rpm limit","code":"insufficient_quota"}
+# 只看关键词会误判成额度耗尽，导致每 60 秒原样重试。结构化 code 优先修正它。
+
+
+def test_extract_error_code_nested_error_object():
+    body = '{"error":{"message":"boom","code":"RateLimitExceeded.EndpointTPMExceeded"}}'
+    assert extract_error_code(body) == "ratelimitexceeded.endpointtpmexceeded"
+
+
+def test_extract_error_code_top_level():
+    assert extract_error_code('{"code":"insufficient_quota"}') == "insufficient_quota"
+
+
+def test_extract_error_code_returns_none_on_non_json():
+    assert extract_error_code("plain text error") is None
+
+
+def test_extract_error_code_returns_none_on_non_dict():
+    assert extract_error_code("[1,2,3]") is None
+
+
+def test_rate_limit_code_wins_over_quota_wording():
+    """429 + tpm/rpm 正文 + insufficient_quota code → 仍是瞬时限流。"""
+    body = (
+        '{"error":{"message":"inference exceeds tpm/rpm limit",'
+        '"type":"rate_limit_error","code":"insufficient_quota"}}'
+    )
+    retry, mark, _ = classify_error(429, body)
+    assert retry is True
+    assert mark == KeyStatus.rate_limited
+
+
+def test_explicit_tpm_code_marks_rate_limited():
+    body = '{"error":{"message":"slow down","code":"RateLimitExceeded.EndpointTPMExceeded"}}'
+    retry, mark, _ = classify_error(429, body)
+    assert retry is True
+    assert mark == KeyStatus.rate_limited
+
+
+def test_quota_code_without_rate_wording_marks_exhausted():
+    body = '{"error":{"message":"account balance depleted","code":"insufficient_quota"}}'
+    retry, mark, _ = classify_error(429, body)
+    assert retry is True
+    assert mark == KeyStatus.exhausted

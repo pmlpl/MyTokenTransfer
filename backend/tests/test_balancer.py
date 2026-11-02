@@ -13,7 +13,9 @@ from sqlalchemy import select
 from app.models import ApiKey, Channel, ChannelKey, ChannelTier, Provider
 from app.models.enums import KeyStatus, KeyStrategy
 from app.relay.balancer import (
+    account_backoff_level,
     account_is_rate_limited,
+    account_rate_limited_remaining,
     final_resort_keys,
     last_resort_keys,
     mark_account_rate_limited,
@@ -21,6 +23,7 @@ from app.relay.balancer import (
     model_quota_is_limited,
     now_utc,
     ordered_keys,
+    reset_account_backoff,
     routing_affinity,
 )
 
@@ -180,6 +183,78 @@ def test_account_rate_limited_scopes_to_account():
     assert account_is_rate_limited(3, "acct-A")
     assert not account_is_rate_limited(3, "acct-B")   # 同 provider 不同账号不受牵连
     assert not account_is_rate_limited(4, "acct-A")   # 不同 provider 不受牵连
+
+
+def _expire_account_cooldown(provider_id: int, account_label: str) -> None:
+    """把账号冷却拨到过去，模拟"冷却到期后再次被限流"的新事件。"""
+    from app.relay import balancer
+
+    key = (provider_id, account_label)
+    if key in balancer._account_rate_limited_until:
+        balancer._account_rate_limited_until[key] = now_utc() - timedelta(seconds=1)
+
+
+def test_account_backoff_grows_on_repeated_rate_limits():
+    """连续限流（跨事件）时冷却阶梯递增，止住「每 60 秒原样重试全池」。"""
+    mark_account_rate_limited(5, "acct-X")
+    first = account_rate_limited_remaining(5, "acct-X")
+    _expire_account_cooldown(5, "acct-X")
+    mark_account_rate_limited(5, "acct-X")
+    second = account_rate_limited_remaining(5, "acct-X")
+    _expire_account_cooldown(5, "acct-X")
+    mark_account_rate_limited(5, "acct-X")
+    third = account_rate_limited_remaining(5, "acct-X")
+    assert first < second < third
+    assert account_backoff_level(5, "acct-X") == 3
+
+
+def test_account_backoff_caps_at_max_step():
+    for _ in range(10):
+        mark_account_rate_limited(6, "acct-Y")
+        _expire_account_cooldown(6, "acct-Y")
+    # 阶梯封顶 15 分钟；计数继续涨但冷却不再变长
+    assert account_rate_limited_remaining(6, "acct-Y") <= 900
+    assert account_backoff_level(6, "acct-Y") == 10
+
+
+def test_reset_account_backoff_clears_ladder():
+    mark_account_rate_limited(7, "acct-Z")
+    reset_account_backoff(7, "acct-Z")
+    assert account_backoff_level(7, "acct-Z") == 0
+    # 先让冷却过期再标记，才算新事件
+    _expire_account_cooldown(7, "acct-Z")
+    mark_account_rate_limited(7, "acct-Z")
+    assert account_backoff_level(7, "acct-Z") == 1
+    assert account_rate_limited_remaining(7, "acct-Z") <= 60
+
+
+def test_concurrent_burst_does_not_escalate_ladder():
+    """同一秒内一波 429 是同一个限流事件，只升一级。
+
+    实测过：并发 8 请求各收到 429，若每个都升级，阶梯 1 秒内从 60 冲到 900。
+    """
+    for _ in range(8):
+        mark_account_rate_limited(9, "acct-burst")
+    assert account_backoff_level(9, "acct-burst") == 1
+    assert account_rate_limited_remaining(9, "acct-burst") <= 60
+
+
+def test_ladder_escalates_across_distinct_episodes():
+    """冷却到期后再次被限流才算新事件，逐级升级。"""
+    mark_account_rate_limited(10, "acct-ep")
+    _expire_account_cooldown(10, "acct-ep")
+    mark_account_rate_limited(10, "acct-ep")
+    _expire_account_cooldown(10, "acct-ep")
+    mark_account_rate_limited(10, "acct-ep")
+    assert account_backoff_level(10, "acct-ep") == 3
+    assert account_rate_limited_remaining(10, "acct-ep") <= 300
+
+
+def test_explicit_cooldown_bypasses_backoff():
+    """显式传 cooldown 的调用方（健康探测）不受退避阶梯影响。"""
+    mark_account_rate_limited(8, "acct-W", cooldown=30)
+    assert account_rate_limited_remaining(8, "acct-W") <= 30
+    assert account_backoff_level(8, "acct-W") == 0
 
 
 async def test_rate_limited_future_cooldown_skipped(db_session):

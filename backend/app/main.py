@@ -12,12 +12,11 @@ from app.core.cache import close_redis, init_redis
 from app.core.scheduler import shutdown_scheduler, start_scheduler
 from app.core.structlog import configure_logging
 from app.relay.logging_middleware import RelayLoggingMiddleware
-
+from app.core.security import load_pwd_override
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     configure_logging()  # 统一结构化日志（structlog + stdlib）
-    from app.core.security import load_pwd_override
     load_pwd_override()  # 恢复 runtime 主密码 override（改密接口写入）
     await init_redis(settings.REDIS_URL)  # 配置热缓存（不可用时降级，不影响转发）
     start_scheduler()  # 定时巡检：自动重测并恢复劣化密钥
