@@ -129,6 +129,44 @@ def test_budget_never_below_floor():
     assert st.floor >= tb._TPM_FLOOR
 
 
+def test_budget_will_not_drop_below_largest_successful_request():
+    """实测回归：预算被降到 51840，而真实请求 365235 →
+    每条请求都"超预算"，每窗口只能发一条，退化成 60 秒一发。"""
+    st = _state()
+    big = 365235
+    st.on_success(big)                      # 这条请求证明上游至少容得下它
+    st.budget = tb._TPM_FLOOR               # 模拟被 429 一路压到地板
+    st.window.clear()
+    st.window.append((time.monotonic(), st.budget))
+    st.last_decrease_at = 0.0
+    st.on_rate_limit(50_000)                # 再吃一个 429
+    assert st.budget >= big * 1.05          # 不得低于已成功请求规模
+
+
+def test_budget_hold_logged_when_already_at_evidence_floor(caplog=None):
+    st = _state()
+    st.on_success(400_000)
+    st.budget = st.max_success * 1.05
+    st.window.clear()
+    st.window.append((time.monotonic(), st.budget))
+    st.last_decrease_at = 0.0
+    before = st.budget
+    st.on_rate_limit(100_000)
+    assert st.budget == before              # 压到底就不再压
+
+
+def test_oversized_request_fits_after_learning_its_size():
+    """同一个大请求重复出现时，第二次不该再被迫等满一个窗口。"""
+    big = 365_000
+    ok, _ = tb.tpm_reserve(PID, ACCT, MODEL, big)
+    assert ok is True
+    tb.tpm_settle(PID, ACCT, MODEL, big, big)
+    # 换个账号模拟"新窗口"，预算应从成功记录学到该规模
+    ok2, wait2 = tb.tpm_reserve(PID, "acct-fresh", MODEL, big)
+    st2 = tb._get_tpm_state(PID, "acct-fresh", MODEL)
+    assert st2.budget >= big
+
+
 def test_budget_never_above_ceil():
     st = _state()
     st.on_success(tb._TPM_CEIL * 10)

@@ -10,6 +10,11 @@ WORKDIR /app
 # ======== 构建阶段：装编译依赖 → pip 安装生产依赖到 /install ========
 FROM base AS builder
 
+# pip 源。国内直连 pypi.org 常被限速到 10 kB/s 量级（实测 pyyaml 806 kB 下 92 秒），
+# 整个依赖树要构建几十分钟以上。默认留空走官方源，国内构建时传：
+#   docker compose build --build-arg PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple backend
+ARG PIP_INDEX_URL=
+
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         build-essential pkg-config libssl-dev libffi-dev \
@@ -17,8 +22,8 @@ RUN apt-get update \
 
 COPY pyproject.toml ./
 # 注意：pyproject 未定义 [standard] extra，直接装生产依赖组
-RUN pip install --upgrade pip \
- && pip install --prefix=/install .
+RUN pip install --upgrade pip ${PIP_INDEX_URL:+--index-url "$PIP_INDEX_URL"} \
+ && pip install --prefix=/install ${PIP_INDEX_URL:+--index-url "$PIP_INDEX_URL"} .
 
 # ======== 运行阶段：只带运行时依赖 + 代码 ========
 FROM base AS runtime

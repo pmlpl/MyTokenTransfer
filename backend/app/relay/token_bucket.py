@@ -238,7 +238,7 @@ class _TpmState:
     """
 
     __slots__ = ("budget", "window", "last_decrease_at", "successes", "seed",
-                 "floor", "provider_id", "account_label", "model")
+                 "floor", "provider_id", "account_label", "model", "max_success")
 
     def __init__(self, seed: int, provider_id: int = 0,
                  account_label: str | None = None, model: str = ""):
@@ -248,6 +248,11 @@ class _TpmState:
         self.window: deque[tuple[float, float]] = deque()
         self.last_decrease_at = 0.0
         self.successes = 0
+        # 历史上成功过的最大单条请求。预算绝不能被降到它之下：
+        # 一条请求能成功就证明上游限额至少这么大，盲目调低只会让后续
+        # 每条请求都"超过预算"而每个窗口只能发一条（实测降到 51840，
+        # 而真实请求 365235，导致每条都等满 60 秒）。
+        self.max_success = 0.0
         # 身份标识：每条预算调整日志都要能定位到具体账号，否则多账号并发时
         # 日志里只有孤零零的数字，无法判断是哪个账号在降/在升。
         self.provider_id = provider_id
@@ -329,6 +334,8 @@ class _TpmState:
 
     def on_success(self, actual: float) -> None:
         """成功调用：抬预算到至少容得下这条请求，并做慢速探测上调。"""
+        if actual > self.max_success:
+            self.max_success = float(actual)
         target = actual * _TPM_INCREASE_FACTOR
         if target > self.budget:
             self.budget = min(float(_TPM_CEIL), target)
@@ -339,7 +346,12 @@ class _TpmState:
             self.budget = min(float(_TPM_CEIL), self.budget * _TPM_PROBE_FACTOR)
 
     def on_rate_limit(self, est: float) -> None:
-        """收到 429：仅当窗口确实被打满时才乘性下调预算。"""
+        """收到 429：仅当窗口确实被打满时才乘性下调预算。
+
+        下限取 max(floor, max_success × 1.05)：已成功过的请求规模是上游真实
+        限额的**下界证据**，预算再低也不能低于它，否则每条请求都"超预算"，
+        每个滚动窗口只能发一条，退化成 60 秒一发。
+        """
         now = time.monotonic()
         self._prune(now)
         spent = self.spent()
@@ -349,8 +361,18 @@ class _TpmState:
         if now - self.last_decrease_at < _TPM_DECREASE_COOLDOWN:
             return
         self.last_decrease_at = now
+        floor = max(self.floor, self.max_success * 1.05)
         reduced = min(self.budget * _TPM_DECREASE_FACTOR, float(est) * 0.9)
-        self.budget = max(self.floor, reduced)
+        new_budget = max(floor, reduced)
+        if new_budget >= self.budget:
+            # 已到证据下界：不再下调，并确保预算不低于下界本身
+            # （可能因早先的下调或外部赋值而低于它）。
+            if self.budget < floor:
+                self.budget = floor
+            log.info("tpm_budget_hold_at_evidence_floor", **self._log_ctx(),
+                     budget=int(self.budget), floor=int(floor), spent=int(spent))
+            return
+        self.budget = new_budget
         log.warning("tpm_budget_lowered", **self._log_ctx(),
                     budget=int(self.budget), spent=int(spent), est=int(est))
 

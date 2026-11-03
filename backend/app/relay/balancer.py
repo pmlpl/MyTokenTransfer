@@ -37,7 +37,11 @@ _account_rate_limited_until: dict[tuple[int, str | None], datetime] = {}
 # 固定 60 秒的问题：持续限流场景下网关每分钟原样重试全池 key，
 # 每次都撞 429 又重置计时器，客户端侧表现为"一直在重试"。
 # 任意一次成功调用（reset_account_backoff）把阶梯清零。
-_BACKOFF_STEPS = (60, 120, 300, 600, 900)
+#
+# 上限不能定太高：实测 SenseNova 的 window 约 60–90 秒就会滚动恢复，
+# 阶梯冲到 600/900 秒等于把一个 1 分钟的问题锁成 15 分钟死时间。
+# 封顶 300 秒（5 分钟），既止住高频重试，又不会长时间误伤。
+_BACKOFF_STEPS = (60, 120, 180, 300)
 _account_backoff_level: dict[tuple[int, str | None], int] = {}
 
 
