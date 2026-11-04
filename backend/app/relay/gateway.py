@@ -128,6 +128,38 @@ def _is_gateway_read_body_error(err_text: str) -> bool:
 _NETWORK_RETRY = 3
 _NETWORK_BACKOFF = 1.0  # 秒
 
+# 连接阶段超时（秒）。上游按 SNI 阻断时表现为连不上，而不是连上后报错，
+# 所以这个值直接决定"卡住"的时长。原来 10 秒 × 3 次重试 × N 把 key，
+# 6 把 key 最坏要 180 秒才返回 502——客户端只会看到长时间无响应后断连。
+_NETWORK_CONNECT_TIMEOUT = 5.0
+
+# 域名级熔断：网络层（连接超时/拒绝/TLS 中断）失败是按**域名**发生的，
+# 与用哪把 key 无关。一旦某域名的连接失败，同一请求内不再对它换 key 重试，
+# 直接整体失败返回 503，让客户端快速重连——比挂着连接干等 3 分钟好得多。
+# 熔断时长取 30 秒：覆盖一次典型阻断抖动，又不至于把瞬时抖动放大成长期不可用。
+_NETWORK_BREAKER_SEC = 30.0
+_domain_blocked_until: dict[str, float] = {}
+
+
+def _domain_of(url: str) -> str:
+    """从 URL 里取 host 作为熔断键。"""
+    try:
+        return url.split("://", 1)[1].split("/", 1)[0]
+    except IndexError:
+        return url
+
+
+def _domain_is_cooling(url: str) -> bool:
+    until = _domain_blocked_until.get(_domain_of(url))
+    return until is not None and until > time.monotonic()
+
+
+def _trip_domain_breaker(url: str) -> None:
+    host = _domain_of(url)
+    _domain_blocked_until[host] = time.monotonic() + _NETWORK_BREAKER_SEC
+    log.warning("network_breaker_tripped", host=host,
+                cooldown_s=_NETWORK_BREAKER_SEC)
+
 # 账号限流冷却短路阈值（秒）：所有候选 key 冷却剩余 >此值时直接返回 429，
 # 跳过 final_resort。设 0 = 只要全在冷却中就短路——final_resort 对 DeepSeek
 # 等持续限流的模型从未成功，只徒增 doomed 请求并重置冷却计时器导致死循环。
@@ -151,6 +183,7 @@ async def _send_with_retry(
             return await client.post(url, headers=headers, json=json)
         except Exception as e:
             if attempt == _NETWORK_RETRY - 1:
+                _trip_domain_breaker(url)
                 raise
             log.warning("network_retry", url=url, attempt=attempt + 1,
                         error=f"{type(e).__name__}: {e}")
@@ -391,6 +424,7 @@ async def route_chat_completions(
         )
 
     budget_blocked_wait: float | None = None
+    network_failed = False  # 本次请求内是否发生过网络层失败（域名熔断依据）
 
     for tier, key in attempts:
         if account_is_rate_limited(key.provider_id, key.account_label) and not allow_account_limited:
@@ -418,6 +452,14 @@ async def route_chat_completions(
             _refund_budget(key, native, reserved)
             continue
         url = _join(base, "chat/completions")
+        # 域名熔断：同一域名刚发生过网络层失败，且本次请求已经因为网络问题
+        # 失败过 → 换 key 没有意义（同池 key 指向同一域名），立刻整体失败。
+        if network_failed and _domain_is_cooling(url):
+            _refund_budget(key, native, reserved)
+            last_error = "上游域名网络不可达（已熔断）"
+            log.warning("network_breaker_skip", channel_id=channel.id,
+                        host=_domain_of(url), key_id=key.id)
+            break
         try:
             raw = decrypt_value(key.key_value)
         except Exception:
@@ -429,7 +471,9 @@ async def route_chat_completions(
         t0 = time.time()
 
         if stream:
-            client = httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=10.0))
+            client = httpx.AsyncClient(
+                timeout=httpx.Timeout(600.0, connect=_NETWORK_CONNECT_TIMEOUT)
+            )
             same_key_retry = 0  # 上游网关 read body failed 原地重试计数
             should_continue = False  # 需要换下一个 key 时置 True
             while True:
@@ -440,6 +484,7 @@ async def route_chat_completions(
                 except Exception as e:
                     await client.aclose()
                     last_error = f"{type(e).__name__}: {e}"
+                    network_failed = True  # 标记：同域名换 key 无意义
                     should_continue = True  # 网络异常不原地重试，走外层换 key
                     _refund_budget(key, native, reserved)
                     break
@@ -541,10 +586,13 @@ async def route_chat_completions(
             )
         else:
             try:
-                async with httpx.AsyncClient(timeout=httpx.Timeout(600.0, connect=10.0)) as client:
+                async with httpx.AsyncClient(
+                    timeout=httpx.Timeout(600.0, connect=_NETWORK_CONNECT_TIMEOUT)
+                ) as client:
                     resp = await _send_with_retry(client, url, headers=_headers(raw), json=payload)
             except Exception as e:
                 last_error = f"{type(e).__name__}: {e}"
+                network_failed = True  # 标记：同域名换 key 无意义
                 _refund_budget(key, native, reserved)
                 continue
             latency_ms = int((time.time() - t0) * 1000)
@@ -625,6 +673,21 @@ async def route_chat_completions(
                 status_code=resp.status_code,
                 content={"error": {"message": msg, "type": "upstream_error"}},
             )
+
+    # 网络层失败（ConnectTimeout / ConnectError / TLS 中断）：换 key 解决不了
+    # 同一域名连不上的问题。返回 503 + Retry-After，让客户端快速重连，
+    # 而不是给 502 让它以为网关挂了立刻猛重试。
+    if network_failed:
+        log.warning("all_upstreams_network_failed", channel_id=channel.id,
+                    virtual_model=virtual, error=last_error)
+        return JSONResponse(
+            status_code=503,
+            headers={"Retry-After": str(int(_NETWORK_BREAKER_SEC))},
+            content={"error": {
+                "message": f"上游网络不可达（{last_error}），请稍后重试",
+                "type": "upstream_unreachable",
+            }},
+        )
 
     # 全部尝试失败。若失败原因是限流且所有账号现在都在冷却中，返回 429 而非 502：
     # 502 会让客户端当成"网关故障"立刻猛重试，429 + 真实 Retry-After 才是正确信号。
