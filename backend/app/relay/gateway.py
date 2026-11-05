@@ -307,16 +307,27 @@ async def _revive_if_exhausted(key: ApiKey, db: AsyncSession) -> None:
         await mark_key(key, KeyStatus.active, db, message="真实请求成功，自动恢复")
 
 
-# TPM 控速的输出 token 预估默认值：客户端未设 max_tokens 时取此值。
-# 保守取 4096（多数 agent 步骤的典型输出上限）。
-_DEFAULT_OUTPUT_ESTIMATE = 4096
+# TPM 控速的输出 token 预估默认值。
+#
+# 关键：max_tokens 是**上限**，不是实际生成量。ZCode 会照常带
+# max_tokens=128000，但一次工具调用实际只吐几百 token。按上限预扣会让
+# 每条请求都预占 12.8 万——比整分钟预算还大，直接把每条请求推进
+# "超大请求放行一次"分支，事前控速彻底失效（实测诊断日志
+# estimate_calc: prompt_est=97298, output_est=128000, reserved=225298）。
+#
+# 上游 TPM 记的是真实产生的 output，所以预估该用"典型输出量"而不是上限。
+# 实测 agent 工具调用步骤多在数百 token 量级，取 1024 作为保守估计；
+# 真正生成更多时，结算会用实际 usage 补差。
+_DEFAULT_OUTPUT_ESTIMATE = 1024
+_MAX_OUTPUT_ESTIMATE_CEIL = 8192
 
 
 def _estimate_parts(body: dict) -> tuple[int, int]:
     """粗估一次请求的 (prompt token, output token)，用于 TPM 事前控速。
 
     prompt: 约 3 字符/token（对中英文混合的保守估计），未乘校准系数；
-    output: 用 max_tokens（客户端设的上限），否则取默认预估。
+    output: 取 max_tokens 与常见输出量的较小者——max_tokens 只是上限，
+            实际生成通常远小于它，按上限预扣会严重超占预算。
     """
     prompt_chars = 0
     for m in body.get("messages") or []:
@@ -331,7 +342,10 @@ def _estimate_parts(body: dict) -> tuple[int, int]:
                     prompt_chars += len(str(seg.get("text", "")))
     prompt_est = max(1, prompt_chars // 3)
     max_output = body.get("max_tokens") or body.get("max_completion_tokens")
-    output_est = int(max_output) if max_output else _DEFAULT_OUTPUT_ESTIMATE
+    if max_output:
+        output_est = min(int(max_output), _MAX_OUTPUT_ESTIMATE_CEIL)
+    else:
+        output_est = _DEFAULT_OUTPUT_ESTIMATE
     return prompt_est, output_est
 
 
@@ -542,6 +556,15 @@ async def route_chat_completions(
         if not acquire_rpm(key.id, native):
             continue  # RPM 桶空：换下一把，不占预算
         reserved = _reserve_estimate(native, prompt_est, output_est)
+        if _upstream_calls == 0:
+            # 诊断：每次请求只打一条，用来核对预扣是否真的吃到了缓存率折算。
+            # ZCode 场景 prompt 动辄 20 万 token 而命中率 99%，预扣若不折算会
+            # 直接高于整分钟预算，把每条请求都推到"超大请求放行一次"分支。
+            log.info("estimate_calc", channel_id=channel.id, native_model=native,
+                     prompt_est=prompt_est, output_est=output_est,
+                     est_factor=round(_EST_FACTOR.get(native, 0.0), 3),
+                     cache_ratio=round(_CACHE_RATIO.get(native, 0.0), 3),
+                     reserved=reserved)
         allowed, wait = tpm_reserve(
             key.provider_id, key.account_label, native, reserved,
         )
@@ -889,6 +912,15 @@ async def _stream_passthrough(client: httpx.AsyncClient, response: httpx.Respons
         _acct = meta.get("account_label")
         if usage:
             actual = billable_tokens(usage)
+            # 诊断：确认流式响应里的 usage 结构，以及缓存字段到底落在哪。
+            log.info("stream_usage_seen", native_model=_native,
+                     usage_keys=sorted(usage.keys()),
+                     prompt_tokens=int(usage.get("prompt_tokens") or 0),
+                     cached_in_details=int(
+                         (usage.get("prompt_tokens_details") or {}).get("cached_tokens") or 0
+                     ) if isinstance(usage.get("prompt_tokens_details"), dict) else None,
+                     prompt_cache_hit_tokens=int(usage.get("prompt_cache_hit_tokens") or 0),
+                     billable=actual, reserved=_reserved)
             tpm_settle(_pid, _acct, _native, _reserved, actual)
             _update_est_factor(_native, int(meta.get("est_base", 0)),
                                int(usage.get("prompt_tokens") or 0))

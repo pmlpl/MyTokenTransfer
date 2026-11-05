@@ -221,3 +221,46 @@ def test_stale_evidence_allows_budget_to_decrease(monkeypatch):
 def test_evidence_ttl_is_minutes_not_hours():
     """保质期要短到能跟住额度变化，又不能短到让每次成功白学。"""
     assert 300 <= tb._TPM_EVIDENCE_TTL <= 1800
+
+
+# ── 6. max_tokens 是上限，不能当预测量 ───────────────────────────
+
+def test_output_estimate_clamps_max_tokens():
+    """ZCode 带 max_tokens=128000，但实际一次工具调用只吐几百 token。
+
+    按上限预扣会让每条请求预占 12.8 万——超过整分钟预算，把每条请求都推进
+    "超大请求放行一次"分支，事前控速完全失效（实测诊断日志：
+    prompt_est=97298, output_est=128000, reserved=225298）。
+    """
+    _p, out = gw._estimate_parts({"messages": [{"role": "user", "content": "x" * 3000}],
+                                  "max_tokens": 128_000})
+    assert out <= gw._MAX_OUTPUT_ESTIMATE_CEIL
+    assert out < 128_000
+
+
+def test_output_estimate_respects_small_max_tokens():
+    """客户端自己限得小就按它来（不要反向上调）。"""
+    _p, out = gw._estimate_parts({"messages": [{"role": "user", "content": "hi"}],
+                                  "max_tokens": 8})
+    assert out == 8
+
+
+def test_output_estimate_default_without_max_tokens():
+    _p, out = gw._estimate_parts({"messages": [{"role": "user", "content": "hi"}]})
+    assert out == gw._DEFAULT_OUTPUT_ESTIMATE
+
+
+def test_reserve_with_cache_and_output_cap_stays_sane():
+    """真实 ZCode 请求的预扣必须落在合理量级，而不是几十万。"""
+    _p, out = gw._estimate_parts({"messages": [{"role": "user", "content": "x" * 291_894}],
+                                  "max_tokens": 128_000})
+    # 模拟已学到 99% 命中
+    saved = dict(gw._CACHE_RATIO)
+    try:
+        gw._CACHE_RATIO["glm-5.2"] = 0.99
+        gw._EST_FACTOR.pop("glm-5.2", None)
+        reserved = gw._reserve_estimate("glm-5.2", 97_298, out)
+        assert reserved < 20_000, f"预扣 {reserved} 仍然过大，会撑爆分钟预算"
+    finally:
+        gw._CACHE_RATIO.clear()
+        gw._CACHE_RATIO.update(saved)
