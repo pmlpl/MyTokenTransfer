@@ -124,15 +124,19 @@ def _rpm_for(model_name: str) -> int:
 
 
 # ── TPM（每分钟 token 数）预算配置 ──────────────────────────────────
-# 种子值：仅作自适应起点，不是硬上限。实测单次 agent 请求可达 33 万 token
-# （长会话整段历史每次全带上），旧的 30000 令牌桶容量 15000 装不下任何一条
-# 真实请求，导致 TPM 层从未生效。
-_TPM_SEED = _env_int("MTT_TOKEN_BUCKET_TPM", 400_000)
+# 种子值：仅作自适应起点，不是硬上限。
+#
+# 2026-11-05 实测上游真实 TPM 边界（单 key，48k 冷请求每 10 秒一发）：
+#   t+0/10 429 → t+21/32/42 200 200 200 → t+50/60/70 429 → t+82 200 ...
+# 即每分钟约放过 15.6 万 token（未命中缓存的输入 + 输出）。旧的 40 万种子
+# 是真实上限的 2.5 倍——网关按 40 万放行，上游按 15.6 万拒收，必然 429。
+# 取 15 万作为自学习起点，交给 AIMD 上下微调。
+_TPM_SEED = _env_int("MTT_TOKEN_BUCKET_TPM", 150_000)
 
 # 预算上下限。下限防止 429 把预算压到发不出正常请求；
-# 上限防止某次异常大头把预算永久抬高。
+# 上限防止某次异常大头把预算永久抬高（留 4 倍余量给有更大配额的账号）。
 _TPM_FLOOR = _env_int("MTT_TOKEN_BUCKET_TPM_MIN", 50_000)
-_TPM_CEIL = _env_int("MTT_TOKEN_BUCKET_TPM_MAX", 4_000_000)
+_TPM_CEIL = _env_int("MTT_TOKEN_BUCKET_TPM_MAX", 600_000)
 
 # 预算不足时最多等待多少秒再重发；超过则直接 429。
 _TPM_MAX_WAIT = _env_float("MTT_TOKEN_BUCKET_TPM_MAX_WAIT", 8.0)
@@ -151,6 +155,12 @@ _TPM_DECREASE_COOLDOWN = 30.0
 
 # 只有窗口消耗达到预算该比例时才认为"是 TPM 打满"，才调预算。
 _TPM_DECREASE_THRESHOLD = 0.5
+
+# 「成功过的请求规模」这条下界证据的保质期（秒）。
+# SenseNova 的每分钟额度随 5 小时积分池余额浮动：池子满时单请求能过 156k，
+# 快见底时只放行 8k。证据过期后下限回落到配置 floor，允许 AIMD 继续下探；
+# 15 分钟足以覆盖一次正常会话的连续请求，又不会把半小时前的旧证据当现状。
+_TPM_EVIDENCE_TTL = float(_env_int("MTT_TOKEN_BUCKET_EVIDENCE_TTL", 900))
 
 # 按原生模型覆盖种子，格式："deepseek-flash:100000,glm-5.2:800000"
 _MODEL_TPM_OVERRIDES = _parse_model_overrides(
@@ -238,7 +248,8 @@ class _TpmState:
     """
 
     __slots__ = ("budget", "window", "last_decrease_at", "successes", "seed",
-                 "floor", "provider_id", "account_label", "model", "max_success")
+                 "floor", "provider_id", "account_label", "model", "max_success",
+                 "max_success_at")
 
     def __init__(self, seed: int, provider_id: int = 0,
                  account_label: str | None = None, model: str = ""):
@@ -252,7 +263,13 @@ class _TpmState:
         # 一条请求能成功就证明上游限额至少这么大，盲目调低只会让后续
         # 每条请求都"超过预算"而每个窗口只能发一条（实测降到 51840，
         # 而真实请求 365235，导致每条都等满 60 秒）。
+        #
+        # 但这条证据**会过期**（见 max_success_at / _TPM_EVIDENCE_TTL）：
+        # SenseNova 的每分钟额度随 5 小时积分池余额浮动，池子满时能过 156k，
+        # 快耗尽时只放行 8k。永久钉住历史最大成功会导致预算锁在 69k、网关按
+        # 69k 放行而上游按 8k 拒收——实测正是「一直 429 且预算不降」的根因。
         self.max_success = 0.0
+        self.max_success_at = 0.0
         # 身份标识：每条预算调整日志都要能定位到具体账号，否则多账号并发时
         # 日志里只有孤零零的数字，无法判断是哪个账号在降/在升。
         self.provider_id = provider_id
@@ -336,6 +353,7 @@ class _TpmState:
         """成功调用：抬预算到至少容得下这条请求，并做慢速探测上调。"""
         if actual > self.max_success:
             self.max_success = float(actual)
+            self.max_success_at = time.monotonic()
         target = actual * _TPM_INCREASE_FACTOR
         if target > self.budget:
             self.budget = min(float(_TPM_CEIL), target)
@@ -351,6 +369,12 @@ class _TpmState:
         下限取 max(floor, max_success × 1.05)：已成功过的请求规模是上游真实
         限额的**下界证据**，预算再低也不能低于它，否则每条请求都"超预算"，
         每个滚动窗口只能发一条，退化成 60 秒一发。
+
+        但证据有保质期（_TPM_EVIDENCE_TTL）：SenseNova 的每分钟额度随 5 小时
+        积分池余额浮动——池子满时单请求能过 156k，快见底时只放行 8k。若永久
+        钉住历史上那条 66k 的成功记录，预算会卡在 69k 再也降不下来，网关按
+        69k 放行而上游只收 8k，表现为「持续 429 且预算纹丝不动」。
+        证据过期后下限回落到配置的 floor，让 AIMD 能继续下探。
         """
         now = time.monotonic()
         self._prune(now)
@@ -361,7 +385,9 @@ class _TpmState:
         if now - self.last_decrease_at < _TPM_DECREASE_COOLDOWN:
             return
         self.last_decrease_at = now
-        floor = max(self.floor, self.max_success * 1.05)
+        evidence_fresh = (now - self.max_success_at) < _TPM_EVIDENCE_TTL
+        evidence_floor = self.max_success * 1.05 if evidence_fresh else 0.0
+        floor = max(self.floor, evidence_floor)
         reduced = min(self.budget * _TPM_DECREASE_FACTOR, float(est) * 0.9)
         new_budget = max(floor, reduced)
         if new_budget >= self.budget:
@@ -370,11 +396,13 @@ class _TpmState:
             if self.budget < floor:
                 self.budget = floor
             log.info("tpm_budget_hold_at_evidence_floor", **self._log_ctx(),
-                     budget=int(self.budget), floor=int(floor), spent=int(spent))
+                     budget=int(self.budget), floor=int(floor), spent=int(spent),
+                     evidence_fresh=evidence_fresh)
             return
         self.budget = new_budget
         log.warning("tpm_budget_lowered", **self._log_ctx(),
-                    budget=int(self.budget), spent=int(spent), est=int(est))
+                    budget=int(self.budget), spent=int(spent), est=int(est),
+                    evidence_fresh=evidence_fresh)
 
 
 _tpm_states: dict[tuple[int, str | None, str], _TpmState] = {}

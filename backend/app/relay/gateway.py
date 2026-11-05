@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import time
 
 import httpx
@@ -166,6 +167,31 @@ def _trip_domain_breaker(url: str) -> None:
 # 冷却过期后 key 自然回到 attempts，不需要 final_resort 赌窗口。
 _FRESH_COOLDOWN_SEC = 0
 
+# 全池冷却时，剩余冷却不超过此值就在网关内部等掉再发，而不是返回 429。
+# 实测上游 429 后 20–32 秒恢复，退避首档 20 秒正好落在这个范围内：
+# 原地等 20 秒大概率成功，而返回 429 会让客户端先做自己的退避 + 重连，
+# 用户看到的就是 ZCode 的"重新连接中 5/10"。
+_SHORT_COOLDOWN_WAIT = float(os.environ.get("MTT_RELAY_SHORT_COOLDOWN_WAIT") or 25.0)
+
+
+def billable_tokens(usage: dict | None) -> int:
+    """本次请求实际占用上游配额的 token 数。
+
+    上游（SenseNova）的 TPM 口径只算**未命中前缀缓存**的输入 + 输出：
+    实测同一段 48k 文本连发，命中缓存后不再计入限流额度；用户侧统计也
+    印证——日用量 5500 万 token 里 5400 万是"输入（命中）"，全程未限流。
+    因此把 prompt_tokens 全额计入会把自己限得比上游还死：
+    一段 70k prompt / 69k 命中的真实 agent 请求，对上游只占 ~1k，
+    按全额记账却要吃掉整个分钟预算。
+    """
+    if not usage:
+        return 0
+    prompt = int(usage.get("prompt_tokens") or 0)
+    completion = int(usage.get("completion_tokens") or 0)
+    details = usage.get("prompt_tokens_details") or {}
+    cached = int(details.get("cached_tokens") or 0) if isinstance(details, dict) else 0
+    return max(0, prompt - cached) + completion
+
 
 async def _send_with_retry(
     client: httpx.AsyncClient,
@@ -286,11 +312,10 @@ async def _revive_if_exhausted(key: ApiKey, db: AsyncSession) -> None:
 _DEFAULT_OUTPUT_ESTIMATE = 4096
 
 
-def _estimate_tokens(body: dict) -> int:
-    """粗估一次请求的总 token 数（prompt + output），用于 TPM 事前控速。
+def _estimate_parts(body: dict) -> tuple[int, int]:
+    """粗估一次请求的 (prompt token, output token)，用于 TPM 事前控速。
 
-    保守高估优于低估——多扣的会在响应返回后按实际 usage 修正。
-    prompt: 约 3 字符/token（对中英文混合的保守估计）；
+    prompt: 约 3 字符/token（对中英文混合的保守估计），未乘校准系数；
     output: 用 max_tokens（客户端设的上限），否则取默认预估。
     """
     prompt_chars = 0
@@ -307,7 +332,7 @@ def _estimate_tokens(body: dict) -> int:
     prompt_est = max(1, prompt_chars // 3)
     max_output = body.get("max_tokens") or body.get("max_completion_tokens")
     output_est = int(max_output) if max_output else _DEFAULT_OUTPUT_ESTIMATE
-    return prompt_est + output_est
+    return prompt_est, output_est
 
 
 # 预估偏差校准：len/3 对中文是明显低估（一个汉字约 1 token，不是 1/3）。
@@ -318,12 +343,35 @@ _EST_FACTOR_MIN = 0.5
 _EST_FACTOR_MAX = 5.0
 _EST_FACTOR_ALPHA = 0.3
 
+# 前缀缓存命中率估计：上游 TPM 只算未命中缓存的部分，而网关在**发请求前**
+# 根本不知道这次会命中多少（同一段 prompt，前缀没变就几乎全命中）。
+# 因此按模型维护一个 cached/prompt 的 EMA，事前预扣时按 (1 - 命中率) 折算。
+#
+# 不这么做会自锁：真实 ZCode 请求 70k prompt 里 69k 命中，实际只占 1.3k 配额，
+# 但事前按 70k 预扣 → 两条就吃满整个分钟预算 → 后续请求被自己的预算挡住
+# （实测压测里第 7 条起连续 429「本分钟 token 预算不足」）。
+# 从 0 起学（保守先按全额预扣），命中后自然下降。
+_CACHE_RATIO: dict[str, float] = {}
+_CACHE_RATIO_MAX = 0.98
+_CACHE_RATIO_ALPHA = 0.4
+
 
 def _apply_est_factor(model: str, est: int) -> int:
     factor = _EST_FACTOR.get(model)
     if not factor:
         return est
     return max(1, int(est * factor))
+
+
+def _reserve_estimate(model: str, prompt_est: int, output_est: int) -> int:
+    """事前预扣量：按校准系数放大 prompt，再按(1-缓存命中率)折算，加输出。
+
+    输出 token 不可能命中缓存，必须全额计入。
+    """
+    scaled_prompt = _apply_est_factor(model, prompt_est)
+    ratio = _CACHE_RATIO.get(model, 0.0)
+    billable_prompt = int(scaled_prompt * (1.0 - ratio))
+    return max(1, billable_prompt + output_est)
 
 
 def _update_est_factor(model: str, base_est: int, actual: int) -> None:
@@ -334,6 +382,30 @@ def _update_est_factor(model: str, base_est: int, actual: int) -> None:
     prev = _EST_FACTOR.get(model)
     _EST_FACTOR[model] = (
         ratio if prev is None else prev * (1 - _EST_FACTOR_ALPHA) + ratio * _EST_FACTOR_ALPHA
+    )
+
+
+def _update_cache_ratio(model: str, usage: dict | None) -> None:
+    """用实际 usage 更新该模型的前缀缓存命中率估计。
+
+    命中率 = cached_tokens / prompt_tokens。冷请求会把它往下拉、热请求往上带，
+    EMA 收敛到该会话的真实命中水平；预扣时据此折算，避免按全额预扣把自己锁死。
+    """
+    if not usage:
+        return
+    prompt = int(usage.get("prompt_tokens") or 0)
+    if prompt <= 0:
+        return
+    details = usage.get("prompt_tokens_details") or {}
+    if not isinstance(details, dict):
+        return
+    cached = int(details.get("cached_tokens") or 0)
+    if cached < 0:
+        return
+    ratio = min(_CACHE_RATIO_MAX, max(0.0, cached / prompt))
+    prev = _CACHE_RATIO.get(model)
+    _CACHE_RATIO[model] = (
+        ratio if prev is None else prev * (1 - _CACHE_RATIO_ALPHA) + ratio * _CACHE_RATIO_ALPHA
     )
 
 
@@ -353,7 +425,9 @@ async def route_chat_completions(
 ) -> JSONResponse | StreamingResponse:
     virtual = channel.virtual_model
     stream = bool(body.get("stream"))
-    est_tokens = _estimate_tokens(body)  # TPM 事前控速：预估本次请求 token 消耗
+    # TPM 事前控速：prompt 与 output 分开估。prompt 会按缓存命中率折算，
+    # output 必须全额（不可能命中缓存）。
+    prompt_est, output_est = _estimate_parts(body)
     # 缓存亲和：由虚拟模型 + 消息稳定前缀派生路由哈希，同一会话固定同一 key
     affinity = routing_affinity(virtual, body)
 
@@ -378,7 +452,7 @@ async def route_chat_completions(
         native_check = await resolve_native(virtual, tier.provider_id, db)
         wait = tpm_wait(
             key.provider_id, key.account_label, native_check,
-            _apply_est_factor(native_check, est_tokens),
+            _reserve_estimate(native_check, prompt_est, output_est),
         )
         if wait <= 0.0:
             min_wait = 0.0
@@ -402,11 +476,16 @@ async def route_chat_completions(
                  wait_s=round(min_wait, 2))
         await asyncio.sleep(min_wait + 0.05)  # 多等 50ms 让窗口真正滚过去
 
-    # 全部账号在限流冷却中 → 直接返回 429 + Retry-After，不走 final_resort。
-    # final_resort 会对每把冷却中的 key 串行发 doomed 请求 → 429 又重置冷却
-    # 计时器 → 冷却永远过不去 → 死循环。设阈值 0 = 只要全在冷却就短路。
-    # Retry-After 用真实剩余冷却秒数，而非固定 60——退避到 15 分钟时提前
-    # 重试只会白挨一次 429。
+    # 全部账号在限流冷却中。
+    #
+    # 剩余冷却很短时（≤ MTT_RELAY_SHORT_COOLDOWN_WAIT）**在网关内部等掉**再发，
+    # 而不是甩 429 让客户端重连。这是消除 ZCode「重新连接中 N/10」的关键：
+    # 客户端拿到 429 会先做自己的重试退避（通常几秒到十几秒）+ 重建连接，
+    # 比我们原地睡 20 秒慢得多，还会让用户看到连续的"重连"提示。
+    # 实测上游 429 后 20–32 秒就恢复，等待的成功率远高于让客户端重试。
+    #
+    # 冷却还很久（退避已升到 60/90 秒）时不等待：占着连接 90 秒不如直接
+    # 返回 429 + 真实 Retry-After，让客户端明确知道该等多久。
     if attempts and all(
         account_rate_limited_remaining(k.provider_id, k.account_label) > _FRESH_COOLDOWN_SEC
         for _, k in attempts
@@ -415,16 +494,42 @@ async def route_chat_completions(
             account_rate_limited_remaining(k.provider_id, k.account_label)
             for _, k in attempts
         )
-        log.info("all_fresh_cooldown_429", channel_id=channel.id,
-                 virtual_model=virtual, retry_after_s=int(remaining))
-        return JSONResponse(
-            status_code=429,
-            headers={"Retry-After": str(ceil_div_seconds(remaining))},
-            content={"error": {"message": "所有上游账号处于限流冷却期", "type": "rate_limited"}},
-        )
+        if remaining <= _SHORT_COOLDOWN_WAIT:
+            log.info("cooldown_wait_inline", channel_id=channel.id,
+                     virtual_model=virtual, wait_s=round(remaining, 1))
+            await asyncio.sleep(remaining + 0.1)
+        else:
+            log.info("all_fresh_cooldown_429", channel_id=channel.id,
+                     virtual_model=virtual, retry_after_s=int(remaining))
+            return JSONResponse(
+                status_code=429,
+                headers={"Retry-After": str(ceil_div_seconds(remaining))},
+                content={"error": {"message": "所有上游账号处于限流冷却期", "type": "rate_limited"}},
+            )
 
     budget_blocked_wait: float | None = None
     network_failed = False  # 本次请求内是否发生过网络层失败（域名熔断依据）
+
+    # ── 短冷却优先：等首选 key，别切到冷的 key ──────────────────────
+    # 大 prompt 的连续性会话里，首选 key 的缓存前缀命中率最高（实测 66k prompt
+    # 命中 65.8k，实际只占 232 token），换 key 要重算整段前缀。首选 key 只是
+    # 短暂冷却（≤ MTT_RELAY_SHORT_COOLDOWN_WAIT）时，等它比换一把划算得多。
+    # attempts 已按亲和顺序排列，attempts[0] 就是该会话的首选 key。
+    if attempts:
+        _pref_tier, _pref_key = attempts[0]
+        _pref_wait = account_rate_limited_remaining(_pref_key.provider_id, _pref_key.account_label)
+        if 0 < _pref_wait <= _SHORT_COOLDOWN_WAIT and not allow_account_limited:
+            log.info("affinity_wait_for_key", channel_id=channel.id,
+                     key_id=_pref_key.id, wait_s=round(_pref_wait, 1))
+            await asyncio.sleep(_pref_wait + 0.1)
+
+    # 429 的扇出次数上限：一次用户请求最多向上游发几次。
+    # 每次失败重试都会消耗另一把 key 的 RPM 配额。实测每把 key 每分钟只放行
+    # 4–5 次，而一次请求失败会连打 3 把 key——失败本身就在制造新的失败
+    # （越 429 越紧张）。限成 2 次：留一次换 key 的机会，又不会把一场
+    # 429 放大成三场。
+    _MAX_UPSTREAM_ATTEMPTS = 2
+    _upstream_calls = 0
 
     for tier, key in attempts:
         if account_is_rate_limited(key.provider_id, key.account_label) and not allow_account_limited:
@@ -436,7 +541,7 @@ async def route_chat_completions(
         # 预算不够只跳过这把 key；全部跳过时在循环外统一返回 429。
         if not acquire_rpm(key.id, native):
             continue  # RPM 桶空：换下一把，不占预算
-        reserved = _apply_est_factor(native, est_tokens)
+        reserved = _reserve_estimate(native, prompt_est, output_est)
         allowed, wait = tpm_reserve(
             key.provider_id, key.account_label, native, reserved,
         )
@@ -468,6 +573,15 @@ async def route_chat_completions(
             continue
 
         payload = _build_payload(body, native, stream, base_url=base)
+        # 扇出上限：本请求此前的尝试已经耗掉别的 key 的配额，再换 key 只会
+        # 制造更多 429。到上限就带着已知的 last_error 收尾。
+        if _upstream_calls >= _MAX_UPSTREAM_ATTEMPTS:
+            _refund_budget(key, native, reserved)
+            log.info("upstream_attempt_cap_reached", channel_id=channel.id,
+                     virtual_model=virtual, attempts=_upstream_calls,
+                     last_error=str(last_error)[:120])
+            break
+        _upstream_calls += 1
         t0 = time.time()
 
         if stream:
@@ -578,8 +692,8 @@ async def route_chat_completions(
                 "native_model": native,
                 "t0": t0,
                 "account_label": key.account_label,
-                "est_tokens": reserved,  # 已乘预估校准系数，结算时用同口径
-                "est_base": est_tokens,  # 未乘系数的原始预估，用于更新校准系数
+                "est_tokens": reserved,       # 事前预扣量（已按缓存率折算），结算时原样替换
+                "est_base": prompt_est,       # 未乘系数的 prompt 预估，用于校准 len/3 偏差
             }
             return StreamingResponse(
                 _stream_passthrough(client, response, meta), media_type="text/event-stream"
@@ -600,12 +714,15 @@ async def route_chat_completions(
                 data = resp.json()
                 await _revive_if_exhausted(key, db)
                 reset_account_backoff(key.provider_id, key.account_label)
-                # TPM 结算：把窗口里的预估值替换成实际 usage，并据此校准预估系数
+                # TPM 结算：把窗口里的预估值替换成实际占用额（只算未命中缓存
+                # 的部分）。校准用 prompt 全额对 prompt 预估，缓存率单独学——
+                # 两者混在一起会让「命中率高」被误当成「预估高估」。
                 _usage = data.get("usage")
                 if _usage:
-                    _actual = (_usage.get("prompt_tokens", 0) or 0) + (_usage.get("completion_tokens", 0) or 0)
-                    tpm_settle(key.provider_id, key.account_label, native, reserved, _actual)
-                    _update_est_factor(native, est_tokens, _actual)
+                    tpm_settle(key.provider_id, key.account_label, native,
+                               reserved, billable_tokens(_usage))
+                    _update_est_factor(native, prompt_est, int(_usage.get("prompt_tokens") or 0))
+                    _update_cache_ratio(native, _usage)
                 # 无 usage 时保留预留值（请求确实消耗了 token，按估算记账比退回更保守）
                 await write_call_log(
                     channel_id=channel.id,
@@ -771,9 +888,11 @@ async def _stream_passthrough(client: httpx.AsyncClient, response: httpx.Respons
         _pid = meta["provider_id"]
         _acct = meta.get("account_label")
         if usage:
-            actual = (usage.get("prompt_tokens", 0) or 0) + (usage.get("completion_tokens", 0) or 0)
+            actual = billable_tokens(usage)
             tpm_settle(_pid, _acct, _native, _reserved, actual)
-            _update_est_factor(_native, int(meta.get("est_base", 0)), actual)
+            _update_est_factor(_native, int(meta.get("est_base", 0)),
+                               int(usage.get("prompt_tokens") or 0))
+            _update_cache_ratio(_native, usage)
         elif status == "error":
             tpm_release(_pid, _acct, _native, _reserved)
         # 用独立任务写日志：即使客户端中途断开导致生成器被取消，日志也能落库

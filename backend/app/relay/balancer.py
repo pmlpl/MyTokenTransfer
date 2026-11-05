@@ -38,10 +38,14 @@ _account_rate_limited_until: dict[tuple[int, str | None], datetime] = {}
 # 每次都撞 429 又重置计时器，客户端侧表现为"一直在重试"。
 # 任意一次成功调用（reset_account_backoff）把阶梯清零。
 #
-# 上限不能定太高：实测 SenseNova 的 window 约 60–90 秒就会滚动恢复，
-# 阶梯冲到 600/900 秒等于把一个 1 分钟的问题锁成 15 分钟死时间。
-# 封顶 300 秒（5 分钟），既止住高频重试，又不会长时间误伤。
-_BACKOFF_STEPS = (60, 120, 180, 300)
+# 阶梯必须贴近上游真实恢复时间。2026-11-05 实测（单 key，48k 冷请求，
+# 每 10 秒发一次）：429 之后 20–32 秒即恢复，稳定呈
+#   t+0/10 429 → t+21/32/42 200 200 200 → t+50/60/70 429 → t+82 200 ...
+# 的周期。旧的 60→120→180→300 阶梯把 20 秒的可恢复限流锁成 5 分钟死时间，
+# 正是 ZCode「重新连接中 5/10」的直接来源。
+# 新阶梯 20→40→60→90：首档略短于实测恢复时间，撞一次 429 自动升档自纠；
+# 封顶 90 秒仍能止住高频重试，又不会把 1 分钟的问题放大成 5 分钟。
+_BACKOFF_STEPS = (20, 40, 60, 90)
 _account_backoff_level: dict[tuple[int, str | None], int] = {}
 
 
@@ -229,30 +233,51 @@ async def ordered_keys(
     """
     rows = await db.execute(select(ChannelKey).where(ChannelKey.channel_tier_id == tier.id))
     cks = list(rows.scalars())
-    pairs: list[tuple[ChannelKey, ApiKey]] = []
-    for ck in cks:
-        ak = await db.get(ApiKey, ck.key_id)
-        if not ak:
-            continue
+
+    def _usable(ck: ChannelKey, ak: ApiKey) -> bool:
         if ak.status == KeyStatus.rate_limited:
             # 冷却已到期但巡检尚未复测回 active：直接当可用，最多省一个巡检周期的容量
             if ak.rate_limited_until and ak.rate_limited_until > now_utc():
-                continue
+                return False
         elif ak.status != KeyStatus.active:
+            return False
+        return True
+
+    def _model_usable(kms) -> bool:
+        if kms is None:
+            return True
+        if kms.status == KeyStatus.rate_limited:
+            # 冷却已到期但巡检尚未复测回 active：当可用
+            # 与密钥级 fast-path 同理，省一个巡检周期（10 分钟）的付费兜底
+            if kms.rate_limited_until and kms.rate_limited_until > now_utc():
+                return False
+            return True
+        return kms.status == KeyStatus.active
+
+    # all_pairs：层内全部密钥（不因冷却而变动），只用来确定"亲和序号 → 哪把 key"。
+    # pairs：其中当前真正可用的子集。
+    all_pairs: list[tuple[ChannelKey, ApiKey]] = []
+    for ck in cks:
+        ak = await db.get(ApiKey, ck.key_id)
+        if ak:
+            all_pairs.append((ck, ak))
+
+    usable_ids: set[int] = set()
+    for ck, ak in all_pairs:
+        if not _usable(ck, ak):
             continue
-        # 模型级细粒度状态：该密钥在当前模型上 exhausted/invalid/冷却中则跳过
         if model_name:
             kms = await get_key_model_status(db, ak.id, model_name)
-            if kms is not None:
-                if kms.status == KeyStatus.rate_limited:
-                    # 冷却已到期但巡检尚未复测回 active：当可用
-                    # 与密钥级 fast-path 同理，省一个巡检周期（10 分钟）的付费兜底
-                    if kms.rate_limited_until and kms.rate_limited_until > now_utc():
-                        continue
-                elif kms.status != KeyStatus.active:
-                    continue
-        pairs.append((ck, ak))
+            if not _model_usable(kms):
+                continue
+        usable_ids.add(ak.id)
 
+    # 关键：排序与亲和移位都必须在**完整列表**上做。
+    # 若先过滤掉冷却中的 key 再 `affinity % len(pairs)`，任何一把 key 进冷却都会
+    # 改变列表长度 → 同一会话被重定位到另一把 key → 上游前缀缓存（按 key 隔离）
+    # 全部失效 → 原本只占几百 token 的请求变成整段 prompt 的冷请求 → 撞限流 →
+    # 该 key 又进冷却 → 再次重定位。实测这是 ZCode「每两条就 429 一条」的死循环。
+    pairs = list(all_pairs)
     if strategy == KeyStrategy.priority:
         pairs.sort(key=lambda x: (-x[0].priority, x[0].id))
     elif strategy == KeyStrategy.weighted:
@@ -282,7 +307,9 @@ async def ordered_keys(
         if affinity and len(pairs) > 1:
             idx = affinity % len(pairs)
             pairs = pairs[idx:] + pairs[:idx]
-    return [p[1] for p in pairs]
+
+    # 最后再按可用性过滤，保留上面算好的相对顺序
+    return [p[1] for p in pairs if p[1].id in usable_ids]
 
 
 async def last_resort_keys(

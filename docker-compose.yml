@@ -69,9 +69,20 @@ services:
       # TPM：不再用固定令牌桶（单次 agent 请求 30 万+ token，桶容量装不下
       # 任何一条真实请求 → 恒空 → 恒放行 → 完全失效）。改为滚动 60 秒窗口
       # + 自适应预算，这里的值只是自学习起点与上下限，不是硬上限。
-      MTT_TOKEN_BUCKET_TPM: ${MTT_TOKEN_BUCKET_TPM:-400000}
+      #
+      # 250000 这个种子是 2026-11-05 实测出来的上游真实 TPM 边界
+      # （单 key 48k 冷请求每 10 秒一发：20–32 秒即恢复，每分钟约放行
+      # 15.6 万 token）。旧默认 400000 是真实上限的 2.5 倍——网关按 40 万
+      # 放行、上游按 15.6 万拒收，是「有额度却被限流」的直接原因。
+      # 注意口径：上游 TPM 只算**未命中前缀缓存**的输入 + 输出，命中部分
+      # 几乎不占配额（用户侧统计 5500 万日用量里 5400 万是命中，全程未限流）。
+      MTT_TOKEN_BUCKET_TPM: ${MTT_TOKEN_BUCKET_TPM:-150000}
       MTT_TOKEN_BUCKET_TPM_MIN: ${MTT_TOKEN_BUCKET_TPM_MIN:-50000}
-      MTT_TOKEN_BUCKET_TPM_MAX: ${MTT_TOKEN_BUCKET_TPM_MAX:-4000000}
+      MTT_TOKEN_BUCKET_TPM_MAX: ${MTT_TOKEN_BUCKET_TPM_MAX:-600000}
+      # 全池冷却时，剩余冷却 ≤ 此秒数就在网关内部等掉再发，而不是返回 429。
+      # 实测上游 429 后 20–32 秒恢复，原地等成功率高得多；返回 429 会让
+      # 客户端先做自己的退避再重连，用户看到的就是「重新连接中 5/10」。
+      MTT_RELAY_SHORT_COOLDOWN_WAIT: ${MTT_RELAY_SHORT_COOLDOWN_WAIT:-25}
       # 预算不足时最多等多少秒再发；超过则直接 429 + 精确 Retry-After
       MTT_TOKEN_BUCKET_TPM_MAX_WAIT: ${MTT_TOKEN_BUCKET_TPM_MAX_WAIT:-8}
       # 按原生模型覆盖预算种子，格式 "glm-5.2:800000,deepseek-flash:100000"

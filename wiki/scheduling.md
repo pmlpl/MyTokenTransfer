@@ -242,7 +242,7 @@ gateway 侧：全部候选都不放行时，若最短等待 ≤ `TPM_MAX_WAIT`�
 
 | 事件 | 动作 |
 | --- | --- |
-| 初始化 | `budget = 种子`（默认 40 万，可按模型覆盖） |
+| 初始化 | `budget = 种子`（默认 **15 万**，实测上游真实边界约 15.6 万/分钟/key，可按模型覆盖） |
 | 请求成功 | `budget = max(budget, actual × 1.15)` —— 能成功说明预算至少这么大 |
 | 每 10 次成功 | `budget ×= 1.02` 慢速探测上调 |
 | 429 且窗口消耗 ≥ 预算 × 0.5 | `budget = min(budget × 0.6, est × 0.9)`，**每 30 秒最多降一次** |
@@ -250,8 +250,15 @@ gateway 侧：全部候选都不放行时，若最短等待 ≤ `TPM_MAX_WAIT`�
 
 钳制：`floor = max(TPM_MIN, 种子 × 0.1)`，`ceil = TPM_MAX`。
 
-结算与退款：
-- 成功有 `usage` → `tpm_settle(预留, 实际)` 覆盖窗口里的预估值
+### 计费口径：只算未命中缓存的部分
+
+上游（SenseNova）的 TPM 只算**未命中前缀缓存的输入 + 输出**，缓存命中部分几乎不占配额。实测依据：同一段 48k 文本连发，命中后不再计入限流额度；用户侧统计也印证——日用量 5500 万 token 里 5400 万是「输入（命中）」，全程未触发限流。
+
+因此网关用 `billable_tokens()` 记账：`(prompt_tokens - cached_tokens) + completion_tokens`。**不这么做会把自己限得比上游还死**——一条 70k prompt / 69k 命中的真实 agent 请求，对上游只占约 1k，按全额记账却要吃掉整个分钟预算。
+
+### 结算与退款
+
+- 成功有 `usage` → `tpm_settle(预留, billable_tokens(usage))` 覆盖窗口里的预估值
 - 请求失败（网络异常 / 非 200 / 解密失败）→ `tpm_release(预留)` 退回，失败不该白占预算
 
 ### 预估校准
@@ -265,9 +272,9 @@ gateway 侧：全部候选都不放行时，若最短等待 ≤ `TPM_MAX_WAIT`�
 | `MTT_TOKEN_BUCKET_RPM` | `20` | 每把 key 每分钟请求数（RPM 桶补充速率 = RPM / 60 令牌/秒） |
 | `MTT_TOKEN_BUCKET_BURST` | `10` | RPM 突发容量（桶满时可连发几个请求不用等补充） |
 | `MTT_TOKEN_BUCKET_MODEL_RPM` | 空 | 按原生模型名覆盖 RPM，格式 `deepseek-flash:5` |
-| `MTT_TOKEN_BUCKET_TPM` | `400000` | TPM 预算种子（自适应起点，非硬上限；`0`=关闭 TPM） |
+| `MTT_TOKEN_BUCKET_TPM` | `150000` | TPM 预算种子（自适应起点，非硬上限；`0`=关闭 TPM）。实测上游真实边界约 15.6 万/分钟/key |
 | `MTT_TOKEN_BUCKET_TPM_MIN` | `50000` | 预算下限 |
-| `MTT_TOKEN_BUCKET_TPM_MAX` | `4000000` | 预算上限 |
+| `MTT_TOKEN_BUCKET_TPM_MAX` | `600000` | 预算上限 |
 | `MTT_TOKEN_BUCKET_TPM_MAX_WAIT` | `8` | 预算不足时最多等待秒数 |
 | `MTT_TOKEN_BUCKET_MODEL_TPM` | 空 | 按原生模型名覆盖预算种子，格式 `glm-5.2:800000` |
 
@@ -340,8 +347,8 @@ _DEGRADED_PROBE_GRACE_MINUTES
 | `_BATCH_CONCURRENCY` | `5` | `health_check.py` | 批量探测并发 |
 | `MTT_TOKEN_BUCKET_RPM` | `20` | `token_bucket.py` | 每 key RPM |
 | `MTT_TOKEN_BUCKET_BURST` | `10` | `token_bucket.py` | RPM 突发容量 |
-| `MTT_TOKEN_BUCKET_TPM` | `400000` | `token_bucket.py` | TPM 预算种子（0=关闭） |
-| `MTT_TOKEN_BUCKET_TPM_MIN` / `_MAX` | `50000` / `4000000` | `token_bucket.py` | 自适应预算上下限 |
+| `MTT_TOKEN_BUCKET_TPM` | `150000` | `token_bucket.py` | TPM 预算种子（0=关闭），实测上游约 15.6 万/分钟 |
+| `MTT_TOKEN_BUCKET_TPM_MIN` / `_MAX` | `50000` / `600000` | `token_bucket.py` | 自适应预算上下限 |
 | `MTT_TOKEN_BUCKET_TPM_MAX_WAIT` | `8` s | `token_bucket.py` | 预算不足时最多等待秒数 |
 | `_FRESH_COOLDOWN_SEC` | `0` | `gateway.py` | 冷却短路阈值（全在冷却→直接 429） |
 

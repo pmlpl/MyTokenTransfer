@@ -155,16 +155,25 @@ def test_budget_hold_logged_when_already_at_evidence_floor(caplog=None):
     assert st.budget == before              # 压到底就不再压
 
 
-def test_oversized_request_fits_after_learning_its_size():
-    """同一个大请求重复出现时，第二次不该再被迫等满一个窗口。"""
+def test_oversized_request_is_never_permanently_blocked():
+    """单条请求超过整个分钟预算时，窗口空着就必须放行一次。
+
+    否则那条请求永远发不出去（等多久都不够），长会话 agent 会直接卡死。
+    注意预算状态是 per-account 的，别指望新账号能继承别的账号学到的规模。
+    """
+    big = 365_000
+    ok, wait = tb.tpm_reserve(PID, ACCT, MODEL, big)
+    assert ok is True, f"单条超大请求被拒绝（需等 {wait}s），长会话会永久卡住"
+
+
+def test_account_learns_its_own_request_size():
+    """同一个大请求重复出现时，该账号的预算应被抬到容得下它。"""
     big = 365_000
     ok, _ = tb.tpm_reserve(PID, ACCT, MODEL, big)
     assert ok is True
     tb.tpm_settle(PID, ACCT, MODEL, big, big)
-    # 换个账号模拟"新窗口"，预算应从成功记录学到该规模
-    ok2, wait2 = tb.tpm_reserve(PID, "acct-fresh", MODEL, big)
-    st2 = tb._get_tpm_state(PID, "acct-fresh", MODEL)
-    assert st2.budget >= big
+    st = _state()
+    assert st.budget >= big, f"预算 {st.budget} 仍小于已成功的请求 {big}"
 
 
 def test_budget_never_above_ceil():

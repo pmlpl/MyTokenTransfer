@@ -425,3 +425,42 @@ async def test_routing_affinity_embeddings_input():
     # 数组 input 也确定性
     arr = {"input": ["a", "b"]}
     assert routing_affinity("embed-1", arr) == routing_affinity("embed-1", arr)
+
+
+async def test_affinity_order_is_stable_when_a_key_goes_cooling(db_session):
+    """缓存亲和必须在「有 key 进冷却」时保持稳定。
+
+    上游前缀缓存按 key 隔离：同一条 66k prompt 在命中的 key 上只占 232 token，
+    换到冷 key 就是 66,024 token，直接撞限流。旧实现先过滤冷却 key 再
+    `affinity % len(pairs)`，任何一把 key 进冷却都会改变列表长度 → 同一会话
+    被重定位到另一把 key → 缓存全失效 → 429 → 又进冷却 → 再重定位。
+    实测表现为 ZCode「每两条成功就有一条 429」的死循环。
+    """
+    db = db_session
+    ch = await _channel(db)
+    p = await _provider(db)
+    tier, keys = await _make_tier_with_keys(
+        db, ch, p,
+        (KeyStatus.active, 1, 0),
+        (KeyStatus.active, 1, 0),
+        (KeyStatus.active, 1, 0),
+    )
+
+    # 任意选一个亲和种子，记录"该会话首选哪把 key"
+    affinity = 12345
+    before = await ordered_keys(tier, KeyStrategy.round_robin, db, affinity)
+    assert len(before) == 3
+    first_id = before[0].id
+
+    # 让除首选之外的一把 key 进冷却（不影响首选）
+    victim = next(k for k in keys if k.id != first_id)
+    victim.status = KeyStatus.rate_limited
+    victim.rate_limited_until = now_utc() + timedelta(hours=1)
+    await db.commit()
+
+    after = await ordered_keys(tier, KeyStrategy.round_robin, db, affinity)
+    assert after, "冷却一把 key 后仍有可用 key"
+    assert after[0].id == first_id, (
+        f"会话首选 key 从 {first_id} 漂移到 {after[0].id}——"
+        "缓存会整体失效，冷请求直接撞限流"
+    )
