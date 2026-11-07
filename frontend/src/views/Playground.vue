@@ -103,6 +103,8 @@ import PageHeader from '@/design/components/PageHeader.vue'
 import DataCard from '@/design/components/DataCard.vue'
 
 // 固定接入地址：Tailscale 虚拟网络 IP，不随物理网络（WiFi/热点）变化
+// 走 http + IP：不用 ts.net 域名 —— HTTPS 证书那套（tailscale serve）要额外
+// 绑定 443、且经反向代理时跳转会掉 scheme，对自用网关不划算。
 const fixedUrl = 'http://100.83.19.7:8085/v1'
 
 // 当前网络入口：跟随浏览器访问来源（dev=vite 5175，prod=nginx 8085）
@@ -179,11 +181,35 @@ async function send() {
 async function copy(text: string) {
   if (!text) return
   try {
-    await navigator.clipboard.writeText(text)
+    // navigator.clipboard 只在安全上下文（https 或 localhost）存在。
+    // 经 Tailscale 用 http://100.x.x.x:8085 访问时它是 undefined，
+    // 直接调用会抛错 → 用户看到"复制失败"。此时退回 execCommand。
+    if (window.isSecureContext && navigator.clipboard) {
+      await navigator.clipboard.writeText(text)
+    } else {
+      fallbackCopy(text)
+    }
     message.success('已复制')
   } catch {
     message.error('复制失败')
   }
+}
+
+/** 非安全上下文的兜底：临时 textarea + execCommand('copy')。 */
+function fallbackCopy(text: string) {
+  const ta = document.createElement('textarea')
+  ta.value = text
+  ta.setAttribute('readonly', '')
+  // 必须留在文档内且可见，否则 iOS/部分浏览器 select() 无效；用 fixed 移出视口
+  ta.style.position = 'fixed'
+  ta.style.top = '-9999px'
+  ta.style.opacity = '0'
+  document.body.appendChild(ta)
+  ta.select()
+  ta.setSelectionRange(0, text.length)
+  const ok = document.execCommand('copy')
+  document.body.removeChild(ta)
+  if (!ok) throw new Error('execCommand copy failed')
 }
 
 onMounted(async () => {
