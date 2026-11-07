@@ -30,6 +30,8 @@ vite.config.d.ts
 .env.*.local
 *.pem
 *.key
+# tailscale cert 默认把证书写到当前目录，在仓库根执行会落下一个 .crt
+*.crt
 .env.bak.*
 .env.*.bak
 

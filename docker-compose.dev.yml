@@ -30,7 +30,8 @@ services:
       - "127.0.0.1:8082:8082"
     # uvicorn --reload 首次扫描慢，放宽健康探针的 start_period
     healthcheck:
-      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8082/health"]
+      # 同 docker-compose.yml：镜像里没有 curl，必须用 python 探针
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8082/health', timeout=4).status == 200 else 1)"]
       interval: 10s
       timeout: 5s
       retries: 15
