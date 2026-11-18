@@ -140,19 +140,32 @@ curl http://127.0.0.1:8085/v1/models -H "Authorization: Bearer $GATEWAY_TOKEN"
 
 | 原因 | 证据 | 处理 |
 | --- | --- | --- |
-| 密钥真被上游限流 | 日志页 `status` 为限流类，告警页有事件 | 加更多密钥进池（这是池化的意义）；或降 `MTT_TOKEN_BUCKET_RPM` |
+| 密钥真被上游限流 | 日志页 `status` 为限流类，告警页有事件 | 加更多密钥进池（这是池化的意义）。RPM 会自学习，**不需要手工调** |
 | 令牌桶没生效（单 key 高频打） | 池里只有 1 把 key | 令牌桶无令牌时是「换下一把」，只有一把就无处可换。加 key |
 | 同一 provider 的 TPM 池被打满 | 64 s 内该层全部 429 | 这是 tier 级冷却（60 s）。加 T1 跨供应商兜底层 |
 | 某模型积分池耗尽 | 只有这一个模型 429，同 key 其它模型正常 | 正常行为（300 s 冷却）。换模型或等窗口滚动 |
 | 上游额度真的用尽 | 告警页 `exhausted` | 充值 / 换 key |
 
-想更主动地避免 429，在 compose 的 `backend.environment` 里加：
+**先分清是 RPM 还是 TPM 打的**（这是排查 429 的第一步）：
+
+- **RPM（请求条数）**：`Retry-After` 很短、且窗口内 token 明明没超。agent 会话常见——
+  一分钟发十几条小请求，每条只占几千 token，条数先撞墙。
+- **TPM（token 量）**：`Retry-After` 较长、且那段时间有大 prompt（新会话首个大 context
+  常常一条就打满整分钟预算）。
+
+看日志事件即可区分：`rpm_lowered` / `rpm_probe_raised` 是 RPM 自学习在动作，
+`tpm_budget_lowered` / `tpm_budget_raised` 是 TPM 预算在动作。
+
+RPM 已是自学习（种子 5，成功上调、撞 429 下调），**通常不需要手工配**。
+需要干预时：
 
 ```yaml
-MTT_TOKEN_BUCKET_RPM: "10"        # 更保守的每 key 速率
-MTT_TOKEN_BUCKET_BURST: "5"
-MTT_TOKEN_BUCKET_MODEL_RPM: "glm-5.2:5,deepseek-v4-flash:15"
+MTT_TOKEN_BUCKET_RPM: "3"          # 调低自学习种子（新模型冷启动更保守）
+MTT_TOKEN_BUCKET_MODEL_RPM: "glm-5.2:5"   # 只给某模型指定种子，仍会继续自适应
 ```
+
+若某模型**长期**满负荷 429 而自学习已收敛，说明它的真实配额就这么大——
+这时只能加 key 或加一个跨供应商的 tier（见下一条）。
 
 ### 一直 503 `无可用密钥（全部失效/限流）`
 

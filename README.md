@@ -237,8 +237,9 @@ npm run preview    # 预览构建产物
 
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `MTT_TOKEN_BUCKET_RPM` | `20` | 每把 key 每分钟请求数上限（RPM 桶补充速率） |
-| `MTT_TOKEN_BUCKET_BURST` | `10` | RPM 突发容量（桶满时可连发几个请求） |
+| `MTT_TOKEN_BUCKET_RPM` | `5` | RPM **初始种子**（自学习起点，非硬上限；成功上调、撞 429 下调） |
+| `MTT_TOKEN_BUCKET_RPM_MIN` / `_MAX` | `1` / `60` | RPM 自适应上下限 |
+| `MTT_TOKEN_BUCKET_BURST` | `10` | 突发容量上限（实际 = `min(BURST, 学习到的 rpm)`） |
 | `MTT_TOKEN_BUCKET_MODEL_RPM` | 空 | 按原生模型名覆盖 RPM，格式 `deepseek-flash:5` |
 | `MTT_TOKEN_BUCKET_TPM` | `150000` | TPM 预算**种子**（自适应起点，非硬上限；`0`=关闭 TPM）。实测上游真实边界约 15.6 万/分钟/key |
 | `MTT_TOKEN_BUCKET_TPM_MIN` | `50000` | 自适应预算下限（防 429 把预算压到发不出正常请求） |
@@ -495,7 +496,7 @@ ruff format .
 | 前端全页 Network Error | Vite 把 `/api` 代理到了 `8085`，但生产栈没起。`docker compose up -d` 起生产，或把 `vite.config.ts` 的两个 proxy target 改成 `8082`。 |
 | 后端连不上 MySQL | MySQL 容器映射在宿主机 **3307**（不是 3306）。容器内访问要经 `host.docker.internal:3307`。 |
 | 某个虚拟模型 404 `未找到 model ... 对应的通道` | 通道没建、或 `is_active` 为 false、或客户端填的虚拟模型名与管理台不一致。 |
-| 一直 429 | 看管理台「告警」与「日志」页：可能是 key 状态劣化、模型池冷却、或 tier TPM 冷却。可下调 `MTT_TOKEN_BUCKET_RPM` 让令牌桶更早介入。 |
+| 一直 429 | 看管理台「告警」与「日志」页：可能是 key 状态劣化、模型池冷却、或 tier TPM 冷却。先分清是 RPM（条数）还是 TPM（token 量）打的——见 [troubleshooting.md](wiki/troubleshooting.md)。RPM 已自学习，通常无需手工调。 |
 | 面板成本是科学计数法 | 已修复（`feat(usage): ... fix cost scientific notation`）；若仍出现，检查定价表里该模型是否漏配单价。 |
 | `vite.config.js` 盖住了 `vite.config.ts` | 这是 `vue-tsc -b` 的编译产物，已在 `.gitignore` 里忽略；删掉即可。 |
 

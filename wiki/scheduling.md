@@ -220,8 +220,12 @@ async def _revive_if_exhausted(key, db):
 | 机制 | 时机 | 粒度 | 行为 |
 | --- | --- | --- | --- |
 | 事后冷却 | 已被上游 429 **之后** | (key,模型) / 账号 | 冷却期内跳过 |
-| **RPM 桶** | 请求发出**之前** | (key, 原生模型) | 每次扣 1，无令牌 → 换下一把 key |
+| **RPM 桶** | 请求发出**之前** | (key, 原生模型) | 每次扣 1，无令牌 → 换下一把 key；速率自学习 |
 | **TPM 预算** | 请求发出**之前** | (账号, 原生模型) | 滚动 60 秒窗口记账，放不下则短暂等待或 429 |
+
+> **RPM 与 TPM 是两个独立维度**：RPM 限「一分钟几条请求」，TPM 限「一分钟多少 token」。
+> 一条 agent 请求通常是 RPM 花 1 次、TPM 只花几千（99% 命中前缀缓存），所以真实
+> 瓶颈往往在 RPM——只看 token 量会得出错误结论。
 
 ### 为什么 TPM 不是令牌桶
 
@@ -269,16 +273,48 @@ gateway 侧：全部候选都不放行时，若最短等待 ≤ `TPM_MAX_WAIT`�
 
 | 环境变量 | 默认 | 说明 |
 | --- | :---: | --- |
-| `MTT_TOKEN_BUCKET_RPM` | `20` | 每把 key 每分钟请求数（RPM 桶补充速率 = RPM / 60 令牌/秒） |
-| `MTT_TOKEN_BUCKET_BURST` | `10` | RPM 突发容量（桶满时可连发几个请求不用等补充） |
-| `MTT_TOKEN_BUCKET_MODEL_RPM` | 空 | 按原生模型名覆盖 RPM，格式 `deepseek-flash:5` |
+| `MTT_TOKEN_BUCKET_RPM` | `5` | RPM **初始种子**（自学习起点，非硬上限） |
+| `MTT_TOKEN_BUCKET_RPM_MIN` / `_MAX` | `1` / `60` | RPM 自适应上下限 |
+| `MTT_TOKEN_BUCKET_BURST` | `10` | RPM 突发容量**上限**；实际容量 = `min(BURST, 学习到的 rpm)` |
+| `MTT_TOKEN_BUCKET_MODEL_RPM` | 空 | 按原生模型名指定**初始种子**（仍会继续自适应），格式 `deepseek-flash:5` |
+| `MTT_TOKEN_BUCKET_RPM_EVIDENCE_TTL` | `900` | 「撞 429 时的速率」这条上限证据的保质期（秒） |
 | `MTT_TOKEN_BUCKET_TPM` | `150000` | TPM 预算种子（自适应起点，非硬上限；`0`=关闭 TPM）。实测上游真实边界约 15.6 万/分钟/key |
 | `MTT_TOKEN_BUCKET_TPM_MIN` | `50000` | 预算下限 |
 | `MTT_TOKEN_BUCKET_TPM_MAX` | `600000` | 预算上限 |
 | `MTT_TOKEN_BUCKET_TPM_MAX_WAIT` | `8` | 预算不足时最多等待秒数 |
 | `MTT_TOKEN_BUCKET_MODEL_TPM` | 空 | 按原生模型名覆盖预算种子，格式 `glm-5.2:800000` |
 
-RPM 默认值取 20 的理由：官方接口上限 5 RPS = 300 RPM，免费层实际 RPM 限额未公布，取 20 留足余量。TPM 种子 40 万来自实测单次请求 33.6 万的量级。
+RPM 种子取 5（原为 20）的理由：上游从不公开每模型的 RPM，各模型还不一样（实测
+glm-5.2 约 4–5 次/分、glm-5.3 约 6 次/分）。**20 是真实上限的 3–5 倍**——放行 20 次、
+上游只收 4–6 次，其余必然 429。种子的作用只是自学习起点，取保守值以免一上来就打墙，
+随后由 AIMD 上调回到真实余量。
+
+### RPM 自学习（AIMD）
+
+RPM 不再是写死的常量，由上游反馈学习——这样**新增模型不必再手工标定**。
+
+| 事件 | 动作 |
+| --- | --- |
+| 初始化 | `rpm = 种子`（默认 5；`MODEL_RPM` 可作为该模型的种子） |
+| 每 8 次成功 | `rpm ×= 1.05` 慢速探测上调，且**不越过新鲜的上限证据** |
+| 429（且判定为条数超限） | `rpm ×= 0.6`，并把当时的 rpm 记为「上限证据」，30 秒内最多降一次 |
+| 成功 | 连续成功计数 +1 |
+
+为什么不直接配准：上游不公开各模型的 RPM，靠人填就必然"换个模型撞一次墙"。
+自学习让它自己收敛，代价是冷启动期按种子保守发。
+
+**关键约束——只在「条数超限」时下调。** 一条大 prompt 打满 TPM 并不说明请求条数
+超了，压 RPM 会误伤吞吐。判定用 `errors.is_rpm_limited()`，按结构化 code 优先
+（`EndpointRPMExceeded` → 是；`EndpointTPMExceeded` → 否）。线上真实正文是
+`"inference exceeds tpm/rpm limit"` 这种混合形态，光看关键词会判错。
+
+**容量必须对齐「一分钟额度」。** 曾经把 `BURST` 收到 1 想让限速更严格，结果空闲
+攒下的额度被丢弃——用完一格要干等 `60/rpm` 秒，等于把「每分钟 N 次」砍成 1 次
+（15 并发实测仅 1 个 200）。现在容量 = `min(BURST, 学习到的 rpm)`，且随学习结果
+同步调整。
+
+**RPM 桶全空时返回 429 而非 502。** 这类请求一次上游都没发，若落到 502 客户端会
+当成网关故障猛重试，反而加剧限流。
 
 ### 三条设计原则（代码注释原文摘要）
 
@@ -345,12 +381,15 @@ _DEGRADED_PROBE_GRACE_MINUTES
 | `_DEGRADED_PROBE_GRACE_MINUTES` | `5` | `health_check.py` | 探测成功保护期 |
 | `_PROBE_ATTEMPTS` / `_RETRY_BACKOFF` | `3` / `1.0` s | `health_check.py` | 探测重试 |
 | `_BATCH_CONCURRENCY` | `5` | `health_check.py` | 批量探测并发 |
-| `MTT_TOKEN_BUCKET_RPM` | `20` | `token_bucket.py` | 每 key RPM |
-| `MTT_TOKEN_BUCKET_BURST` | `10` | `token_bucket.py` | RPM 突发容量 |
+| `MTT_TOKEN_BUCKET_RPM` | `5` | `token_bucket.py` | RPM 初始种子（自学习起点，非硬上限） |
+| `MTT_TOKEN_BUCKET_RPM_MIN` / `_MAX` | `1` / `60` | `token_bucket.py` | RPM 自适应上下限 |
+| `MTT_TOKEN_BUCKET_BURST` | `10` | `token_bucket.py` | 突发容量上限（实际 = min(BURST, 学习到的 rpm)） |
 | `MTT_TOKEN_BUCKET_TPM` | `150000` | `token_bucket.py` | TPM 预算种子（0=关闭），实测上游约 15.6 万/分钟 |
 | `MTT_TOKEN_BUCKET_TPM_MIN` / `_MAX` | `50000` / `600000` | `token_bucket.py` | 自适应预算上下限 |
 | `MTT_TOKEN_BUCKET_TPM_MAX_WAIT` | `8` s | `token_bucket.py` | 预算不足时最多等待秒数 |
 | `_FRESH_COOLDOWN_SEC` | `0` | `gateway.py` | 冷却短路阈值（全在冷却→直接 429） |
+| `_BACKOFF_STEPS` | `(20,40,60)` | `balancer.py` | 账号连续限流退避阶梯，封顶 ≤ TPM 窗口(60s) |
+| `_INLINE_WAIT_CEILING` | `65` s | `gateway.py` | 网关内原地等待硬天花板 |
 
 ## 10. 回归测试
 

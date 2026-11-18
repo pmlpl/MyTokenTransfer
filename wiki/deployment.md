@@ -240,9 +240,10 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 
 | 变量 | 默认 | 说明 | 代码 |
 | --- | :---: | --- | --- |
-| `MTT_TOKEN_BUCKET_RPM` | `20` | 每把 key 每分钟请求上限（RPM 桶） | `relay/token_bucket.py` |
-| `MTT_TOKEN_BUCKET_BURST` | `10` | RPM 突发容量 | 同上 |
-| `MTT_TOKEN_BUCKET_MODEL_RPM` | 空 | 按原生模型名覆盖 RPM，格式 `deepseek-flash:5` | 同上 |
+| `MTT_TOKEN_BUCKET_RPM` | `5` | RPM **初始种子**（自学习起点，非硬上限；成功上调、撞 429 下调） | `relay/token_bucket.py` |
+| `MTT_TOKEN_BUCKET_RPM_MIN` / `_MAX` | `1` / `60` | RPM 自适应上下限 | 同上 |
+| `MTT_TOKEN_BUCKET_BURST` | `10` | 突发容量上限（实际 = `min(BURST, 学习到的 rpm)`） | 同上 |
+| `MTT_TOKEN_BUCKET_MODEL_RPM` | 空 | 按原生模型名指定 RPM 初始种子（仍继续自适应），格式 `deepseek-flash:5` | 同上 |
 | `MTT_TOKEN_BUCKET_TPM` | `150000` | TPM 预算种子（自适应起点；0=关闭）。实测上游约 15.6 万/分钟/key | 同上 |
 | `MTT_TOKEN_BUCKET_TPM_MIN` | `50000` | 预算下限 | 同上 |
 | `MTT_TOKEN_BUCKET_TPM_MAX` | `600000` | 预算上限 | 同上 |
