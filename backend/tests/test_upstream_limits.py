@@ -174,6 +174,103 @@ def test_short_cooldown_wait_is_short_enough_for_http():
     assert gw._SHORT_COOLDOWN_WAIT <= 40
 
 
+# ── 4b. 原地等待上限必须跟随退避阶梯，否则升档后永久失效 ──────────
+
+def test_inline_wait_ceiling_follows_backoff_ladder(monkeypatch):
+    """退避阶梯的全部档位都得落在原地等待上限内。
+
+    这是 2026-11-18 那波「重新连接」风暴的结构性成因：阶梯 20→40→60→90，
+    而等待阈值固定 25 秒。一旦退避升到 40 秒以上，剩余冷却恒 > 25，
+    "原地等"分支永久失效，网关只能甩 429，客户端随即重连
+    （实测 02:31–03:20 共 22 次 429 全是这个原因）。
+    """
+    monkeypatch.setattr(gw, "_SHORT_COOLDOWN_WAIT", 25.0)
+    monkeypatch.setattr(gw, "_INLINE_WAIT_CEILING", 65.0)
+    ceiling = gw.inline_wait_ceiling()
+    assert ceiling >= max(balancer._BACKOFF_STEPS), (
+        f"退避最高档 {max(balancer._BACKOFF_STEPS)}s 超出等待上限 {ceiling}s，"
+        "升档后网关会开始甩 429 让客户端重连"
+    )
+
+
+def test_inline_wait_ceiling_never_exceeds_hard_cap(monkeypatch):
+    """上限不能超过硬天花板——等太久等于换一种方式制造客户端超时。"""
+    monkeypatch.setattr(gw, "_INLINE_WAIT_CEILING", 40.0)
+    monkeypatch.setattr(balancer, "_BACKOFF_STEPS", (20, 300))
+    assert gw.inline_wait_ceiling() == 40.0
+
+
+def test_inline_wait_ceiling_never_below_configured_floor(monkeypatch):
+    """阶梯若被配得比现有阈值还短，也不能把等待上限拉低到旧值以下。"""
+    monkeypatch.setattr(gw, "_SHORT_COOLDOWN_WAIT", 25.0)
+    monkeypatch.setattr(gw, "_INLINE_WAIT_CEILING", 65.0)
+    monkeypatch.setattr(balancer, "_BACKOFF_STEPS", (5,))
+    assert gw.inline_wait_ceiling() == 25.0
+
+
+def test_backoff_steps_never_exceed_tpm_window():
+    """冷却封顶不得超过 TPM 滚动窗口长度。
+
+    TPM 限流按 60 秒滚动窗口恢复，窗口一旦滚过就必然有容量。冷却超过窗口
+    长度的那部分秒数等不到任何新容量，是纯死时间：既救不回请求，又因为
+    超出网关原地等待上限而被迫甩 429 让客户端重连（原阶梯封顶 90 秒正是
+    2026-11-18 那波风暴的成因）。
+    """
+    window = tb._TPM_WINDOW_SEC
+    assert max(balancer._BACKOFF_STEPS) <= window, (
+        f"退避封顶 {max(balancer._BACKOFF_STEPS)}s 超过 TPM 窗口 {window}s，"
+        "多出的等待是死时间"
+    )
+
+
+def test_inline_wait_ceiling_covers_full_backoff_after_cap():
+    """把阶梯压回窗口内之后，等待上限必须能覆盖全部档位（否则仍会甩 429）。"""
+    assert gw.inline_wait_ceiling() >= max(balancer._BACKOFF_STEPS)
+
+
+# ── 4c. Retry-After 必须指向「最早能用的那把 key」 ────────────────
+
+def test_retry_after_targets_earliest_recovering_key():
+    """多把 key 冷却时，客户端该等的是最早恢复的那把，不是最后恢复的。
+
+    旧实现取 max：6 把 key 里 5 把冷却 90 秒、1 把 20 秒时也要等 90 秒，
+    白白丢掉那把 20 秒后就能用的容量。Retry-After 指向最早的才不浪费。
+    """
+    from datetime import timedelta
+
+    balancer.mark_account_rate_limited(7, "late", cooldown=90)
+    balancer.mark_account_rate_limited(7, "early", cooldown=20)
+
+    remaining = [
+        balancer.account_rate_limited_remaining(7, acct) for acct in ("late", "early")
+    ]
+    assert min(remaining) <= 21, "最早恢复的那把 key 应该约 20 秒后可用"
+    assert max(remaining) >= 89, "最晚恢复的那把 key 确实要等 90 秒"
+    # 网关取 min → Retry-After 约 20 秒，而不是 90 秒
+    assert min(remaining) < max(remaining)
+
+
+def test_cooling_predicate_uses_any_not_min():
+    """「是否还有 key 在冷却」必须用 any 判定，不能用 min(...) > 0。
+
+    回归护栏：曾把判定和取值一起改成 min，结果只要有任意一把 key 已解冻，
+    min 就是 0 → 判定为"无需 429" → 落到 502 分支。实测 5 并发里出现 1 个
+    502（客户端会当网关故障猛重试，比 429 更糟）。
+    """
+    from datetime import timedelta
+
+    balancer.mark_account_rate_limited(7, "still_cooling", cooldown=60)
+    # "warm" 未标记，冷却剩余为 0
+    per_key = [
+        balancer.account_rate_limited_remaining(7, acct)
+        for acct in ("still_cooling", "warm")
+    ]
+    assert min(per_key) == 0, "已解冻的 key 让 min 归零——这正是 bug 的形态"
+    cooling = [r for r in per_key if r > 0]
+    assert cooling, "但确实还有 key 在冷却，必须判为需要 429"
+    assert min(cooling) > 0, "取值仍用最早恢复的那把"
+
+
 # ── 5. 证据下界会过期，否则预算永久锁死 ──────────────────────────
 
 def _tpm_state_with_success(model="glm-5.2", success=66_024):

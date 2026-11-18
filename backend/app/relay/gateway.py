@@ -173,6 +173,33 @@ _FRESH_COOLDOWN_SEC = 0
 # 用户看到的就是 ZCode 的"重新连接中 5/10"。
 _SHORT_COOLDOWN_WAIT = float(os.environ.get("MTT_RELAY_SHORT_COOLDOWN_WAIT") or 25.0)
 
+# 等待上限的硬天花板（秒）：等待塞在请求里，不能长到让客户端或 nginx 拆连接。
+#
+# 取 65 = TPM 滚动窗口(60s) + 余量。理由与证据：
+# - TPM 限流按 60 秒窗口恢复，等满一个窗口必然有新容量，再久没有意义；
+# - 实测真实成功请求的延迟本就有 58–93 秒（call_logs.latency_ms 63190/93587），
+#   客户端已有这个量级的容忍度，65 秒的等待不比一次正常慢请求更长；
+# - nginx proxy_read_timeout=900s，不会提前断。
+# 原值 40 是凭空取的，比退避封顶(60s)还短，导致高档位冷却仍会被迫甩 429。
+_INLINE_WAIT_CEILING = float(os.environ.get("MTT_RELAY_INLINE_WAIT_CEILING") or 65.0)
+
+
+def inline_wait_ceiling() -> float:
+    """网关内原地等待的上限（秒）——跟随当前退避档位自适应。
+
+    固定 25 秒的问题：退避阶梯是 20→40→60→90，一旦升到 40 秒以上，
+    剩余冷却恒 > 25 秒，这个"原地等"分支就**永久失效**，网关只能甩 429，
+    客户端随即重连。实测 02:31–03:20 那波风暴里 22 次 429 全是这个原因
+    （退避已升到 90 秒，阈值还停在 25）。
+
+    改为跟随阶梯：取当前阶梯的最大档，但不超过 _INLINE_WAIT_CEILING。
+    这样升到高档位后网关仍会等掉整段冷却，而不是把 429 丢给客户端。
+    """
+    from app.relay.balancer import _BACKOFF_STEPS
+
+    ladder_top = max(_BACKOFF_STEPS) if _BACKOFF_STEPS else _SHORT_COOLDOWN_WAIT
+    return min(_INLINE_WAIT_CEILING, max(_SHORT_COOLDOWN_WAIT, float(ladder_top)))
+
 
 def billable_tokens(usage: dict | None) -> int:
     """本次请求实际占用上游配额的 token 数。
@@ -435,7 +462,7 @@ def _refund_budget(key: ApiKey, native: str, reserved: int) -> None:
 
 
 async def route_chat_completions(
-    channel: Channel, body: dict, db: AsyncSession
+    channel: Channel, body: dict, db: AsyncSession, *, _retry_round: int = 0
 ) -> JSONResponse | StreamingResponse:
     virtual = channel.virtual_model
     stream = bool(body.get("stream"))
@@ -492,32 +519,33 @@ async def route_chat_completions(
 
     # 全部账号在限流冷却中。
     #
-    # 剩余冷却很短时（≤ MTT_RELAY_SHORT_COOLDOWN_WAIT）**在网关内部等掉**再发，
-    # 而不是甩 429 让客户端重连。这是消除 ZCode「重新连接中 N/10」的关键：
-    # 客户端拿到 429 会先做自己的重试退避（通常几秒到十几秒）+ 重建连接，
-    # 比我们原地睡 20 秒慢得多，还会让用户看到连续的"重连"提示。
-    # 实测上游 429 后 20–32 秒就恢复，等待的成功率远高于让客户端重试。
+    # 关键：这里要等的是**最早恢复的那把 key**，不是最后恢复的。只要有一把
+    # 解除冷却，本次请求就能发出去。旧实现取 max(剩余冷却)——6 把 key 里 5 把
+    # 冷却 60 秒、1 把只冷却 20 秒时，也要等 60 秒，白白丢掉那把 20 秒就能用的
+    # 容量。改取 min：20 秒后即可发出。
     #
-    # 冷却还很久（退避已升到 60/90 秒）时不等待：占着连接 90 秒不如直接
-    # 返回 429 + 真实 Retry-After，让客户端明确知道该等多久。
+    # 剩余冷却在等待上限内（见 inline_wait_ceiling，跟随退避档位）就**在网关内部
+    # 等掉**再发，而不是甩 429 让客户端重连。这是消除 ZCode「重新连接中 N/10」的
+    # 关键：客户端拿到 429 会先做自己的重试退避（几秒到十几秒）+ 重建连接。
     if attempts and all(
         account_rate_limited_remaining(k.provider_id, k.account_label) > _FRESH_COOLDOWN_SEC
         for _, k in attempts
     ):
-        remaining = max(
+        # 最早恢复的那把 key 还要等多久
+        earliest = min(
             account_rate_limited_remaining(k.provider_id, k.account_label)
             for _, k in attempts
         )
-        if remaining <= _SHORT_COOLDOWN_WAIT:
+        if earliest <= inline_wait_ceiling():
             log.info("cooldown_wait_inline", channel_id=channel.id,
-                     virtual_model=virtual, wait_s=round(remaining, 1))
-            await asyncio.sleep(remaining + 0.1)
+                     virtual_model=virtual, wait_s=round(earliest, 1))
+            await asyncio.sleep(earliest + 0.1)
         else:
             log.info("all_fresh_cooldown_429", channel_id=channel.id,
-                     virtual_model=virtual, retry_after_s=int(remaining))
+                     virtual_model=virtual, retry_after_s=int(earliest))
             return JSONResponse(
                 status_code=429,
-                headers={"Retry-After": str(ceil_div_seconds(remaining))},
+                headers={"Retry-After": str(ceil_div_seconds(earliest))},
                 content={"error": {"message": "所有上游账号处于限流冷却期", "type": "rate_limited"}},
             )
 
@@ -829,15 +857,51 @@ async def route_chat_completions(
             }},
         )
 
-    # 全部尝试失败。若失败原因是限流且所有账号现在都在冷却中，返回 429 而非 502：
+    # 全部尝试失败。若失败原因是限流且确实还有账号在冷却中，返回 429 而非 502：
     # 502 会让客户端当成"网关故障"立刻猛重试，429 + 真实 Retry-After 才是正确信号。
     # （同一请求内 6 个账号被逐个打冷后尚未重新进入 attempt 循环，短路检查来不及生效。）
-    cooldown = max(
-        (account_rate_limited_remaining(k.provider_id, k.account_label) for _, k in attempts),
-        default=0.0,
-    )
-    if cooldown > 0 and last_error.startswith("HTTP 429"):
-        secs = ceil_div_seconds(cooldown)
+    #
+    # 判定与取值要分开：
+    # - 判定用「是否存在冷却中的 key」（any），否则已解冻的 key 会让它误判成无需 429；
+    # - Retry-After 取「最早恢复的那把」（min），只要一把解冻就能成功，不该让客户端
+    #   按最晚那把（原实现用 max）白等。
+    #
+    # 触发条件不能只看 last_error：若 candidates 非空但循环里每把 key 都被账号冷却
+    # `continue` 跳过，则一次上游都没发，last_error 仍是初始值「无可用上游」，
+    # 原条件 startswith("HTTP 429") 不成立 → 直接掉进 502。实测 20 并发里
+    # 出现 2 次这种 502（客户端会当成网关故障猛重试）。用 _upstream_calls == 0
+    # 把"压根没发出去"也归入冷却场景。
+    remaining = [
+        account_rate_limited_remaining(k.provider_id, k.account_label) for _, k in attempts
+    ]
+    cooling = [r for r in remaining if r > 0]
+    if cooling and (last_error.startswith("HTTP 429") or _upstream_calls == 0):
+        earliest = min(cooling)
+        # 冷却在等待上限内 → 在网关内部等掉再重来一轮，而不是把 429 甩给客户端。
+        #
+        # 为什么必须在**这里**也等：上面的入队等待只在"所有候选 key 都在冷却"
+        # 时生效；而主循环会把 key 逐个打成 429（每打一把就多一把进冷却），
+        # 走完循环时最后一把刚被打冷、其余可能已解冻——不满足 all() 条件，
+        # 于是原实现在这里直接返回 429。实测 8 并发全 200 后，24 并发仍有
+        # 6 次 429、但 retry_after 只有 20 秒（远小于等待上限 60 秒），
+        # 本可以等掉却甩给了客户端。
+        #
+        # 只重来一轮（_retry_round 守卫）：等掉一轮冷却后仍失败就是真没有容量，
+        # 继续等只会把客户端连接拖长，此时返回 429 + 真实 Retry-After 才对。
+        #
+        # 阈值用 _SHORT_COOLDOWN_WAIT 而非 inline_wait_ceiling()：这里等的是
+        # "上游 429 后的自然恢复"（实测 20–32 秒），超过这个量级说明不是普通
+        # 恢复而是容量真被打满——此时等待创造不出容量，只会让注定失败的请求
+        # 多等一轮。实测 20 并发下用大上限等待，429 的返回时间从 24 秒被拖到
+        # 40 秒（等完还是 429），属于纯粹的体验劣化。
+        if earliest <= _SHORT_COOLDOWN_WAIT and _retry_round < 1:
+            log.info("cooling_wait_then_retry", channel_id=channel.id,
+                     virtual_model=virtual, wait_s=round(earliest, 1))
+            await asyncio.sleep(earliest + 0.1)
+            return await route_chat_completions(
+                channel, body, db, _retry_round=_retry_round + 1
+            )
+        secs = ceil_div_seconds(earliest)
         log.info("all_failed_accounts_cooling_429", channel_id=channel.id,
                  virtual_model=virtual, retry_after_s=secs)
         return JSONResponse(
