@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from app.models.enums import KeyStatus
-from app.relay.errors import classify_error, extract_error_code
+from app.relay.errors import classify_error, extract_error_code, is_rpm_limited
 
 
 def test_auth_error_marks_invalid_and_retryable():
@@ -101,3 +101,37 @@ def test_quota_code_without_rate_wording_marks_exhausted():
     retry, mark, _ = classify_error(429, body)
     assert retry is True
     assert mark == KeyStatus.exhausted
+
+
+# ── 429 成因判定：RPM vs TPM ─────────────────────────────────────────
+# RPM 自学习只在「确是请求条数打满」时才下调速率。一条大 prompt 打满
+# TPM 并不说明条数超了，压 RPM 会误伤吞吐——所以这个判定必须准。
+
+def test_is_rpm_limited_detects_rpm_code():
+    body = '{"error":{"message":"slow down","code":"RateLimitExceeded.EndpointRPMExceeded"}}'
+    assert is_rpm_limited(body) is True
+
+
+def test_is_rpm_limited_rejects_tpm_code():
+    """关键反例：TPM 打满时绝不能被判成 RPM 超限。"""
+    body = '{"error":{"message":"slow down","code":"RateLimitExceeded.EndpointTPMExceeded"}}'
+    assert is_rpm_limited(body) is False
+
+
+def test_is_rpm_limited_real_sensenova_tpm_body():
+    """线上真实正文：同时出现 tpm/rpm 字样，但 code 是 TPM —— 判 RPM 会误伤。"""
+    body = (
+        '{"error":{"message":"inference exceeds tpm/rpm limit",'
+        '"type":"rate_limit_error","code":"RateLimitExceeded.EndpointTPMExceeded"}}'
+    )
+    assert is_rpm_limited(body) is False
+
+
+def test_is_rpm_limited_falls_back_to_wording():
+    assert is_rpm_limited('{"error":{"message":"exceeds requests per minute"}}') is True
+    assert is_rpm_limited('{"error":{"message":"tokens per minute exceeded"}}') is False
+
+
+def test_is_rpm_limited_handles_garbage():
+    assert is_rpm_limited("") is False
+    assert is_rpm_limited("not json at all") is False

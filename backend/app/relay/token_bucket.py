@@ -92,12 +92,51 @@ def _read_dotenv(name: str) -> str | None:
 
 
 # ── RPM（每分钟请求数）──────────────────────────────────────────────
-# 默认每把 key 每分钟请求数（RPM）。保守值：免费层避免触发 "429 rpm exhausted"。
-# 官方接口上限 5 RPS = 300 RPM，免费层实际 RPM 限额未公布，取 20 留足余量。
-_DEFAULT_RPM = _env_int("MTT_TOKEN_BUCKET_RPM", 20)
+# RPM = 每分钟允许的请求条数，与内容大小无关；TPM 才是 token 量。
+#
+# 为什么不能靠手工配：上游从不公开每模型的 RPM，各模型还不一样（实测
+# glm-5.2 约 4–5 次/分、glm-5.3 约 6 次/分），而这里是**按模型**配置的
+# 静态常量。每接一个新模型，没人配就落回默认 20（实测真实上限的 3–5 倍）
+# ——放行 20 次、上游只收 4–6 次，其余必然 429。这就是「每换个模型就撞一次
+# 墙」的根因：限速靠人填常量，而不是靠反馈学出来。
+#
+# 因此改为 AIMD 自学习（与 TPM 预算同一套思路）：
+# - 种子保守（_RPM_SEED），宁可一开始少发，也不制造 429；
+# - 成功持续则缓慢上调（_RPM_PROBE_FACTOR），把真实余量找回来；
+# - 撞 429 则乘性下调（_RPM_DECREASE_FACTOR），并把"当前速率"记为上限证据；
+# - 上限证据有保质期（额度随积分池余额浮动，同 TPM 的理由）。
+#
+# 显式的 MTT_TOKEN_BUCKET_MODEL_RPM 仍生效：作为该模型的**初始种子**，
+# 之后照样自适应（不是硬上限），这样既保留手工兜底，又不用每个新模型都配。
+_RPM_SEED = _env_int("MTT_TOKEN_BUCKET_RPM", 5)
 
 # 突发容量：桶满时允许连续发出的请求数（不用等补充）。
+#
+# 不能取 1：容量小于"每分钟额度"时，空闲攒下的额度会被**丢弃**。
+# 取 1 时用完那一个就要干等 60/rpm 秒，而上游真实口径是"每分钟 N 次"
+# ——空闲 50 秒本可攒够 5 次，却只放行 1 次，等于把容量砍掉大半
+# （实测 15 并发仅 1 个 200）。
+#
+# 也不宜过大：容量远大于每分钟额度时，桶满可瞬间连发远超均值的请求，
+# 而上游 429 按瞬时窗口判，会直接打爆。取"一分钟额度即可全部攒下"的量级
+# 最贴合上游口径——_Bucket 会按学习到的 rpm 把容量钳到 min(burst, rpm)。
 _DEFAULT_BURST = _env_int("MTT_TOKEN_BUCKET_BURST", 10)
+
+# 自适应上下限：下限防止 429 把速率压到 1 次/分（正常 agent 会话会被拖死）；
+# 上限防止某次误判把速率永久抬高。
+_RPM_MIN = _env_float("MTT_TOKEN_BUCKET_RPM_MIN", 1.0)
+_RPM_MAX = _env_float("MTT_TOKEN_BUCKET_RPM_MAX", 60.0)
+
+# 成功持续多久才允许上调：太急会在边界反复试探，撞 429 又降回来。
+_RPM_PROBE_EVERY = _env_int("MTT_TOKEN_BUCKET_RPM_PROBE_EVERY", 8)
+_RPM_PROBE_FACTOR = 1.05
+_RPM_DECREASE_FACTOR = 0.6
+
+# 两次下调之间的最短间隔（秒）：防连发 429 把速率瞬间砸到地板。
+_RPM_DECREASE_COOLDOWN = 30.0
+
+# 上限证据的保质期（秒）：与 TPM 同理，上游额度随积分池余额浮动。
+_RPM_EVIDENCE_TTL = float(_env_int("MTT_TOKEN_BUCKET_RPM_EVIDENCE_TTL", 900))
 
 
 def _parse_model_overrides(raw: str) -> dict[str, int]:
@@ -120,7 +159,8 @@ _MODEL_RPM_OVERRIDES = _parse_model_overrides(
 
 
 def _rpm_for(model_name: str) -> int:
-    return _MODEL_RPM_OVERRIDES.get(model_name, _DEFAULT_RPM)
+    """该模型的 RPM **初始种子**（之后由 AIMD 自适应，不是硬上限）。"""
+    return _MODEL_RPM_OVERRIDES.get(model_name, _RPM_SEED)
 
 
 # ── TPM（每分钟 token 数）预算配置 ──────────────────────────────────
@@ -174,20 +214,65 @@ def _tpm_seed_for(model_name: str) -> int:
 
 # ── RPM 令牌桶 ────────────────────────────────────────────────────────
 class _Bucket:
-    __slots__ = ("capacity", "last_refill", "rate", "tokens")
+    """按 (key, 模型) 的 RPM 令牌桶，速率自学习（AIMD）。
 
-    def __init__(self, rpm: int, capacity: int):
-        self.rate = rpm / 60.0          # tokens / second
-        self.capacity = float(capacity)
-        self.tokens = float(capacity)   # 初始满桶
+    与 TPM 预算同一套思路，但学的维度不同：TPM 学"每分钟能过多少 token"，
+    这里学"每分钟能过多少条请求"。两者独立——一条 30 万 token 的请求只花
+    1 次 RPM，却是整分钟 TPM 的两倍。
+
+    速率不是固定常量：成功持续则上调、撞 429 则下调，从反馈里收敛到上游
+    真实上限。这样新模型接进来不需要人先去测、去配。
+    """
+
+    __slots__ = (
+        "capacity", "last_refill", "rate", "tokens",
+        "successes", "last_decrease_at", "rate_ceiling", "rate_ceiling_at",
+        "seed", "key_id", "model",
+    )
+
+    def __init__(self, rpm: int, capacity: int, key_id: int = 0, model: str = ""):
+        seed = float(max(_RPM_MIN, min(_RPM_MAX, rpm)))
+        self.seed = seed
+        self.rate = seed / 60.0         # tokens / second
+        # 容量钳到"一分钟额度"：既让空闲攒下的额度不被丢弃（capacity 太小
+        # 会把每分钟 N 次砍成 1 次），又不会让 burst 远超均值去打爆瞬时窗口。
+        self.capacity = float(max(1, min(capacity, int(round(seed)))))
+        self.tokens = float(self.capacity)   # 初始满桶
         self.last_refill = time.monotonic()
+        self.successes = 0
+        self.last_decrease_at = 0.0
+        # 撞 429 时的速率快照 = "至少这么快就会被拒" 的实证。
+        # 上调不能显著越过它，否则会反复试探边界、反复 429。
+        self.rate_ceiling = float(_RPM_MAX)
+        self.rate_ceiling_at = 0.0
+        # 身份标识：每条调速日志都要能定位到具体 (key, 模型)
+        self.key_id = key_id
+        self.model = model
+
+    @property
+    def rpm(self) -> float:
+        """当前学习到的每分钟速率。"""
+        return self.rate * 60.0
+
+    def _log_ctx(self) -> dict:
+        return {"key_id": self.key_id, "model": self.model}
 
     def _refill(self) -> None:
         now = time.monotonic()
         elapsed = now - self.last_refill
         if elapsed > 0:
+            # 速率会变，token 上限跟着容量走（token 是"次数"的池子，与 rpm 无关）
             self.tokens = min(self.capacity, self.tokens + elapsed * self.rate)
             self.last_refill = now
+
+    def _set_rpm(self, rpm: float) -> None:
+        clamped = max(_RPM_MIN, min(_RPM_MAX, rpm))
+        self.rate = clamped / 60.0
+        # 容量跟随速率：学到更高额度时容量要跟着放大，否则"每分钟 N 次"
+        # 仍会被旧的小容量卡住；下调时同步收紧，避免残留的令牌形成超额突发。
+        self.capacity = float(max(1, min(_DEFAULT_BURST, int(round(clamped)))))
+        if self.tokens > self.capacity:
+            self.tokens = self.capacity
 
     def acquire(self) -> bool:
         """尝试消耗 1 个令牌。返回 False 表示桶空（应跳过此 key）。"""
@@ -207,6 +292,50 @@ class _Bucket:
         self._refill()
         return self.tokens
 
+    def on_success(self) -> None:
+        """一次请求成功：慢速探测上调，把被 429 压低后的余量找回来。
+
+        只在**连续成功**若干次后上调（_RPM_PROBE_EVERY），且不越过
+        `rate_ceiling`——那是上次撞 429 时的速率快照，越过它必然再撞。
+        上限证据过期后（额度随积分池浮动）才允许突破。
+        """
+        self.successes += 1
+        if self.successes % _RPM_PROBE_EVERY:
+            return
+        now = time.monotonic()
+        evidence_fresh = (now - self.rate_ceiling_at) < _RPM_EVIDENCE_TTL
+        target = self.rpm * _RPM_PROBE_FACTOR
+        if evidence_fresh:
+            target = min(target, self.rate_ceiling)
+        if target > self.rpm + 1e-9:
+            self._set_rpm(target)
+            log.info("rpm_probe_raised", **self._log_ctx(),
+                     rpm=round(self.rpm, 2), ceiling=round(self.rate_ceiling, 2),
+                     evidence_fresh=evidence_fresh)
+
+    def on_rate_limit(self) -> None:
+        """上游返回 429：乘性下调，并把当前速率记为上限证据。
+
+        这条路径是自学习的核心：不必知道上游真实 RPM 是多少，撞一次就
+        学到"这个速率过高"。递减步长按 AIMD 取 0.6，两三次 429 就能收敛
+        到可用区间；`_RPM_DECREASE_COOLDOWN` 防止并发突发把速率瞬间砸到底。
+        """
+        now = time.monotonic()
+        # 无论是否真的下调，都要刷新上限证据：这次 429 证明当前速率过高
+        self.rate_ceiling = self.rpm
+        self.rate_ceiling_at = now
+        if now - self.last_decrease_at < _RPM_DECREASE_COOLDOWN:
+            return
+        self.last_decrease_at = now
+        before = self.rpm
+        self._set_rpm(before * _RPM_DECREASE_FACTOR)
+        log.warning("rpm_lowered", **self._log_ctx(),
+                    rpm=round(self.rpm, 2), before=round(before, 2))
+
+    def on_success_streak_reset(self) -> None:
+        """重置连续成功计数（429 后重新计）。"""
+        self.successes = 0
+
 
 # 全局桶注册表：(key_id, native_model) -> _Bucket
 _buckets: dict[tuple[int, str], _Bucket] = {}
@@ -217,10 +346,12 @@ def _get_bucket(key_id: int, model_name: str) -> _Bucket:
     bucket = _buckets.get(bkey)
     if bucket is None:
         rpm = _rpm_for(model_name)
-        bucket = _Bucket(rpm=rpm, capacity=_DEFAULT_BURST)
+        bucket = _Bucket(rpm=rpm, capacity=_DEFAULT_BURST,
+                         key_id=key_id, model=model_name)
         _buckets[bkey] = bucket
         log.info("token_bucket_created", key_id=key_id, model=model_name,
-                 rpm=rpm, burst=_DEFAULT_BURST)
+                 rpm=rpm, burst=_DEFAULT_BURST,
+                 source="env_override" if model_name in _MODEL_RPM_OVERRIDES else "seed")
     return bucket
 
 
@@ -234,9 +365,46 @@ def release_rpm(key_id: int, model_name: str) -> None:
     _get_bucket(key_id, model_name).refund(1.0)
 
 
+def rpm_on_success(key_id: int, model_name: str) -> None:
+    """上游成功响应：让 RPM 速率慢速探测上调。
+
+    这是自学习闭环的上半部分——没有它，被 429 压低后的速率永远回不来，
+    网关会一直按最低速率发，明明有容量却用不满。
+    """
+    _get_bucket(key_id, model_name).on_success()
+
+
+def rpm_on_rate_limit(key_id: int, model_name: str) -> None:
+    """上游 429：RPM 速率乘性下调并记录上限证据。
+
+    闭环的下半部分。只在确实撞了限流时调用，且必须排除"429 是 TPM 打满
+    导致的"——那种情况该由 tpm_on_rate_limit 处理，压 RPM 会误伤
+    （一条大 prompt 请求打满 TPM，不代表请求条数超了）。
+    """
+    bucket = _get_bucket(key_id, model_name)
+    bucket.on_rate_limit()
+    bucket.on_success_streak_reset()
+
+
 def available_tokens(key_id: int, model_name: str) -> float:
     """查询当前可用 RPM 令牌数（不消耗）。用于日志/调试。"""
     return _get_bucket(key_id, model_name).available()
+
+
+def rpm_snapshot() -> list[dict]:
+    """导出全部 RPM 桶状态，供运维排查「某模型实际学到的上限是多少」。"""
+    return [
+        {
+            "key_id": b.key_id,
+            "model": b.model,
+            "rpm": round(b.rpm, 2),
+            "seed": round(b.seed, 2),
+            "ceiling": round(b.rate_ceiling, 2),
+            "available": round(b.available(), 2),
+            "successes": b.successes,
+        }
+        for b in _buckets.values()
+    ]
 
 
 # ── TPM 滚动窗口 + 自适应预算 ────────────────────────────────────────

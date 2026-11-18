@@ -102,6 +102,29 @@ def _code_is_quota(code: str) -> bool:
     return any(code == c or code.startswith(c) for c in _QUOTA_CODES)
 
 
+def is_rpm_limited(body_text: str) -> bool:
+    """429 是否由「请求条数」打满引起（而非 token 量）。
+
+    RPM 自学习只在**确是条数超限**时才下调速率——一条大 prompt 请求打满
+    TPM 并不说明请求条数超了，压 RPM 会误伤吞吐。
+
+    判定依据：
+    - 结构化 code 明确是 RPM/RPD（`EndpointRPMExceeded` 等）→ 是；
+    - 结构化 code 明确是 TPM（`EndpointTPMExceeded`）→ 否；
+    - 无结构化 code 时退回正文关键词。正文同时含 tpm 与 rpm 时以 tpm
+      优先（上游把两种文案混用时，压 RPM 的代价更大）。
+    """
+    code = extract_error_code(body_text) or ""
+    if "rpm" in code or "rpd" in code or "toomanyrequests" in code:
+        return True
+    if "tpm" in code:
+        return False
+    text = (body_text or "").lower()
+    if "tpm" in text:
+        return False
+    return "rpm" in text or "requests per minute" in text
+
+
 def classify_error(status_code: int, body_text: str) -> tuple[bool, KeyStatus | None, str]:
     """返回 (是否可重试/切换, 标记的状态, 错误描述)。
 

@@ -35,12 +35,19 @@ from app.relay.balancer import (
     resolve_native,
     routing_affinity,
 )
-from app.relay.errors import classify_error, extract_error_code, is_model_pool_quota
+from app.relay.errors import (
+    classify_error,
+    extract_error_code,
+    is_model_pool_quota,
+    is_rpm_limited,
+)
 from app.relay.token_bucket import (
     acquire_rpm,
     ceil_div_seconds,
     max_wait_seconds,
     release_rpm,
+    rpm_on_rate_limit,
+    rpm_on_success,
     tpm_on_rate_limit,
     tpm_release,
     tpm_reserve,
@@ -550,6 +557,7 @@ async def route_chat_completions(
             )
 
     budget_blocked_wait: float | None = None
+    rpm_blocked = False  # 本次请求内是否有 key 被 RPM 桶挡下（限速，非故障）
     network_failed = False  # 本次请求内是否发生过网络层失败（域名熔断依据）
 
     # ── 短冷却优先：等首选 key，别切到冷的 key ──────────────────────
@@ -582,7 +590,13 @@ async def route_chat_completions(
         # 令牌桶事前控速：RPM（按 key）+ TPM 预算（按账号×模型）。
         # 预算不够只跳过这把 key；全部跳过时在循环外统一返回 429。
         if not acquire_rpm(key.id, native):
-            continue  # RPM 桶空：换下一把，不占预算
+            # RPM 桶空：换下一把，同时记下"被 RPM 挡住及其等待时长"。
+            # 必须记录——否则全部 key 都只是被 RPM 挡下时，循环里一次上游
+            # 都没发、last_error 仍是初始值、也不在任何账号冷却中，最终会
+            # 掉进 502（客户端当网关故障猛重试）。burst 收到 1 之后这条路径
+            # 会明显变频繁，所以按"限速"而非"故障"处理。
+            rpm_blocked = True
+            continue
         reserved = _reserve_estimate(native, prompt_est, output_est)
         if _upstream_calls == 0:
             # 诊断：每次请求只打一条，用来核对预扣是否真的吃到了缓存率折算。
@@ -683,6 +697,10 @@ async def route_chat_completions(
                         # 429 说明不是"没发出去"，但也没消耗 token：退回预留，
                         # 同时让自适应预算按 AIMD 下调。
                         tpm_on_rate_limit(key.provider_id, key.account_label, native, reserved)
+                        # 只在确实是「请求条数」打满时下调 RPM 速率。
+                        # 大 prompt 打满 TPM 不代表条数超了，压 RPM 会误伤吞吐。
+                        if is_rpm_limited(err_text):
+                            rpm_on_rate_limit(key.id, native)
                         _refund_budget(key, native, reserved)
                     else:
                         _refund_budget(key, native, reserved)
@@ -765,6 +783,8 @@ async def route_chat_completions(
                 data = resp.json()
                 await _revive_if_exhausted(key, db)
                 reset_account_backoff(key.provider_id, key.account_label)
+                # RPM 自学习：成功即证明当前速率可行，慢速探测上调
+                rpm_on_success(key.id, native)
                 # TPM 结算：把窗口里的预估值替换成实际占用额（只算未命中缓存
                 # 的部分）。校准用 prompt 全额对 prompt 预估，缓存率单独学——
                 # 两者混在一起会让「命中率高」被误当成「预估高估」。
@@ -800,6 +820,9 @@ async def route_chat_completions(
             _is_model_quota = is_model_pool_quota(resp.text) or "entitlement" in (resp.text or "").lower()
             if resp.status_code == 429:
                 tpm_on_rate_limit(key.provider_id, key.account_label, native, reserved)
+                # 仅当确是条数超限时才压 RPM（TPM 打满不代表条数超了）
+                if is_rpm_limited(resp.text):
+                    rpm_on_rate_limit(key.id, native)
             _refund_budget(key, native, reserved)
             if mark == KeyStatus.rate_limited:
                 mark_account_rate_limited(key.provider_id, key.account_label)  # 账号短路：同账号 TPM 冷却
@@ -927,6 +950,23 @@ async def route_chat_completions(
             }},
         )
 
+    if rpm_blocked and _upstream_calls == 0:
+        # 所有候选 key 都被 RPM 桶挡下，一次上游都没发。
+        # 这是**限速**，不是故障：必须返回 429 + Retry-After，不能落到 502
+        # （客户端会把 502 当网关挂了而立刻猛重试，反而加剧限流）。
+        # burst 收到 1 之后这条路径会明显变频繁，所以单独处理。
+        secs = ceil_div_seconds(60.0)
+        log.info("rpm_bucket_blocked_429", channel_id=channel.id,
+                 virtual_model=virtual, retry_after_s=secs)
+        return JSONResponse(
+            status_code=429,
+            headers={"Retry-After": str(secs)},
+            content={"error": {
+                "message": f"上游请求条数已达上限，请 {secs} 秒后重试",
+                "type": "rate_limited",
+            }},
+        )
+
     log.warning(
         "all_upstreams_failed",
         channel_id=channel.id,
@@ -989,6 +1029,10 @@ async def _stream_passthrough(client: httpx.AsyncClient, response: httpx.Respons
             _update_est_factor(_native, int(meta.get("est_base", 0)),
                                int(usage.get("prompt_tokens") or 0))
             _update_cache_ratio(_native, usage)
+            # RPM 自学习：流完整跑完才算一次成功（此处 status 仍为 success）。
+            # 不能放在拿到 200 的地方——那时流刚打开，中途仍可能断。
+            if status == "success":
+                rpm_on_success(meta["key_id"], _native)
         elif status == "error":
             tpm_release(_pid, _acct, _native, _reserved)
         # 用独立任务写日志：即使客户端中途断开导致生成器被取消，日志也能落库
