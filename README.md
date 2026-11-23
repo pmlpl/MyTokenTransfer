@@ -268,7 +268,7 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 2. **供应商页** → 新建供应商：填 `base_url`（OpenAI 兼容端点）、探测方式、以及该供应商支持的模型列表。
 3. **转发通道页** → 建通道：
    - `virtual_model`：对外暴露的**虚拟模型名**（客户端就填这个）；
-   - 把第 1 步的 key 组成池挂到 **T0 主池**，选策略（`round_robin` / `weighted` / `priority`）；
+   - 把第 1 步的 key 组成池挂到 **T0 主池**，选策略（下拉里的 轮询 / 加权 / 优先级，对应 `round_robin` / `weighted` / `priority`）；
    - 可选：再加 **T1+ 跨供应商兜底层**，并配置**模型名映射**（虚拟模型 → 各供应商的原生模型名）。
 4. **定价页** → 给模型填价格（输入 / 输出 / 缓存命中，可填高峰与空闲两档），用量页才有成本数据。
 
@@ -537,6 +537,7 @@ cd frontend && npm run build              # vue-tsc 类型检查 + 构建通过
 - 新增管理台接口时统一挂 `dependencies=[Depends(require_auth)]`；`/v1/*` 挂 `require_gateway`，两套鉴权不要混。
 - 异步 SQLAlchemy 下**不要依赖隐式懒加载**，用 `selectinload` 预取（见 `app/api/channels.py` 的 `_full_channel_stmt`）。
 - 前端新页面放在 `src/views/`，在 `src/router/index.ts` 注册；样式优先复用 `src/design/` 的令牌与通用组件，并同时兼容明暗主题（IDE/系统主题切换）。
+- 前端**界面靠布局自解释，不靠副标题和提示文字**：页面标题只由 `PageHeader` 给一次（布局层没有顶栏）；`DataCard` 标题不与页面名重复；空状态只给结论和一步出路（`EmptyState` 没有 description）；字段含义放进 label / 内建 prefix / tooltip，不铺正文；枚举值不直出（`round_robin` 显示为「轮询」）。**如果一屏非得靠一句解释才看得懂，先改布局。** 详见 [wiki/architecture.md 布局与文案约定](wiki/architecture.md#布局与文案约定)。
 - 提交信息沿用现有前缀：`feat(scope):` / `fix(scope):` / `test(scope):` / `docs:` / `refactor(scope):` / `chore:` / `build(scope):` / `config:`。
 
 ### 报 Bug 时请附上

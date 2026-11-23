@@ -203,7 +203,7 @@ curl http://127.0.0.1:8085/api/alerts -H "Authorization: Bearer <session-token>"
 | `> 0` | 走了跨供应商兜底。看 `provider_id` 是哪个供应商 |
 | 同一时段大量 `> 0` | T0 池有问题（限流/额度/密钥失效），去看告警页 |
 
-Playground 页调试时也会显示「本次由 key #N（T<层> 层）服务」，配合日志页一起看。
+Playground 页调试后会在回复下方显示 `key #N · T<层> 层`，旁边就是跳到调用日志的链接。
 
 ### 成本显示为 0 或明显偏低
 

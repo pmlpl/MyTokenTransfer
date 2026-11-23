@@ -36,7 +36,7 @@
 | 文档 | 内容 |
 | --- | --- |
 | [troubleshooting.md](troubleshooting.md) | 现象 → 原因 → 处理；含已知的文档/代码不一致点 |
-| [changelog.md](changelog.md) | 按日期记录的变更日志（当前 36 次提交，2026-09-01 起） |
+| [changelog.md](changelog.md) | 按日期记录的变更日志（当前 60 次提交，2026-09-01 起） |
 
 ---
 

@@ -3,7 +3,7 @@
 本文件记录 MyTokenTransfer 的版本变更。早期条目由 `git log` 回溯整理（单分支 `master`，无 tag），新建条目请遵循 [README.md](README.md) 里约定的格式。
 
 - **当前版本**：`0.1.0`（尚未打 tag，见 `backend/pyproject.toml`、`frontend/package.json`、`app/main.py` 的 `FastAPI(version=)`）
-- **时间跨度**：2026-09-01 ~ 2026-09-14（35 次提交）
+- **时间跨度**：2026-09-01 ~ 2026-11-23
 - **日期口径**：作者本地日期（北京时间）
 
 格式约定：
@@ -13,6 +13,24 @@
 - **变更** — 行为/接口调整（可能不兼容）
 - **文档** — 仅文档/注释
 - **工程** — 构建、依赖、配置、CI、杂项
+
+---
+
+## [未发布] — 2026-11-23
+
+**变更**
+
+- `refactor(frontend): 砍掉标语与提示文字，用布局替代解释` — 界面改为靠布局自解释：移除 8 个页面 `subtitle`（"密钥与转发整体概览"、"API 厂商 · 模型列表 · 探测方式"之类复述页面名的标语）与 7 个与页面名重复的卡片标题；删除 `MainLayout` 顶栏，告警角标 + 退出登录收进侧栏底部 `sidebar-foot`，页面标题因此只出现一次，内容区多出 56px。用量页删掉 4 条 `% · 峰值时段占比` 进度条——那是为一个看不懂的百分比配的解释文字，连进度条一起移除。价格页高峰时段说明从正文挪进「空闲价」标签旁 tooltip，空闲输入/输出价改为同行并排。Playground 两条地址改用「固定/本机」标签区分，说明进 tooltip；无通道时从一句话改成直接的「创建通道」按钮。设置页删除整页 v2.1 路线图陈列。原始枚举值人性化（`round_robin`→轮询、`openai_models`→OpenAI、`critical`→严重）。`PageHeader` 只剩 `title`、`DataCard` 只剩 `title`、`EmptyState` 只剩 `title`+`actions`，加回副标题等于把否决过的模式又引进来。
+
+**修复**
+
+- `fix(frontend): DataCard 无标题时不再留空标题栏` — 拆出 `header` / `toolbar` 两条路径，只有操作没有标题的卡片走工具栏布局。
+- `fix(frontend): 价格表备注列被操作列挤没` — 收窄价格列使整表 1136px 放下，去掉横向滚动。
+- `fix(frontend): 价格页图表 Y 轴名被裁` — `grid.top` 20 → 36。
+
+**文档**
+
+- `architecture.md` 新增「布局与文案约定」一节，把这次的取舍固化成约定（标题只出现一次、空状态只给结论、字段含义进标签、枚举值不直出）；`billing-and-usage.md`、`troubleshooting.md` 里引用 Playground 旧提示文案的两处同步为实际显示（`key #N · T<层> 层` + 日志链接）。
 
 ---
 

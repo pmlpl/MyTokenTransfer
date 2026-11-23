@@ -56,7 +56,7 @@ model_for_price = native_model or virtual_model
 
 写入字段：`created_at`(UTC)、`channel_id`、`tier_order`、`provider_id`、`key_id`、`virtual_model`、`native_model`、`prompt_tokens`、`completion_tokens`、`total_tokens`、`cached_tokens`、`cost`、`latency_ms`、`status`、`error`（截断到 500 字符）、`stream`。
 
-> 两个运维价值很高的字段：`tier_order`（这次请求最终由第几层兜底服务的）和 `status`/`error`（失败原因）。Playground 页调试时也会显示「本次由 key #N（T<层> 层）服务」。
+> 两个运维价值很高的字段：`tier_order`（这次请求最终由第几层兜底服务的）和 `status`/`error`（失败原因）。Playground 页调试后会在回复下方显示 `key #N · T<层> 层`，旁边直接给一个跳到调用日志的链接。
 
 ---
 

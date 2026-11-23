@@ -194,12 +194,30 @@ frontend/src/
 | `Keys` | 密钥录入/编辑/批量测试/导入导出/reveal |
 | `Providers` | 供应商与模型列表 |
 | `Channels` | 转发通道：Tier 结构、策略、模型映射 |
-| `Playground` | 网关接入信息（地址 + token）+ 端到端调试 |
+| `Playground` | 网关接入信息（固定/本机地址 + token）+ 端到端调试 |
 | `Logs` | 调用日志明细 |
 | `Usage` | 用量统计与趋势（按密钥/模型，近 24 h 波形） |
 | `Pricing` | 模型价格表 + 用量 |
 | `Alerts` | 告警列表与手工 resolve |
-| `Settings` | 系统设置（只读） |
+| `Settings` | 账户密码 · Gateway 接入信息 |
+
+> `Settings` 只保留「账户」与「Gateway」两页。原先第三个「系统」页只是 v2.1 路线图陈列，已删除——没有功能的东西不占导航。
+
+### 布局与文案约定
+
+页面**靠布局自解释，不靠副标题和提示文字**。如果一个页面非得靠一句话才看得懂，那是布局该改，不是文案该加。
+
+| 约定 | 落地方式 |
+| --- | --- |
+| 页面标题只出现一次 | `MainLayout` 无顶栏；标题由各页 `PageHeader` 唯一给出 |
+| 全局操作不占内容高度 | 告警角标 + 退出登录收在侧栏底部（`sidebar-foot`），hover 出 tooltip |
+| 卡片标题不重复页面名 | `DataCard` 的 `title` 可选；只有操作没有标题时走 `toolbar` 路径，不留空标题栏 |
+| 空状态只给结论和出路 | `EmptyState` 只有 `title` + 可选操作按钮，删掉了 `description` |
+| 字段含义进标签或 tooltip | 例：价格页高峰时段说明放在「空闲价」标签旁 `?` tooltip 里，不占正文 |
+| 枚举值不直出 | `round_robin`→轮询、`openai_models`→OpenAI、`critical`→严重 |
+| 表单控件自解释 | 输入框用可见 label 或内置 prefix（如权重/优先），不靠旁边飘一行说明 |
+
+`PageHeader` 因此只剩 `title` 一个 prop，`DataCard` 只剩 `title`，`EmptyState` 只剩 `title` + `actions` 插槽。加回副标题等于把已被否决的模式又引进来。
 
 ### 前端两套鉴权
 

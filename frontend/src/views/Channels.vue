@@ -176,9 +176,9 @@ const form = reactive<{
 }>({ name: '', virtual_model: '', strategy: 'round_robin', max_retries: 3, tiers: [], mappings: [] })
 
 const strategyOptions: SelectOption[] = [
-  { label: '轮询 round_robin', value: 'round_robin' },
-  { label: '加权 weighted', value: 'weighted' },
-  { label: '优先级 priority', value: 'priority' },
+  { label: '轮询', value: 'round_robin' },
+  { label: '加权', value: 'weighted' },
+  { label: '优先级', value: 'priority' },
 ]
 
 const providerOptions = computed<SelectOption[]>(() =>
