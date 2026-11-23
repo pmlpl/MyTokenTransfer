@@ -1,6 +1,6 @@
 <template>
   <div class="alerts-page">
-    <PageHeader title="告警事件" subtitle="密钥状态劣化（额度耗尽 / 认证失效）自动记录">
+    <PageHeader title="告警事件">
       <template #actions>
         <n-radio-group v-model:value="filter" @update:value="load">
           <n-radio-button :value="false">全部</n-radio-button>
@@ -14,7 +14,7 @@
       </template>
     </PageHeader>
 
-    <DataCard title="告警列表">
+    <DataCard>
       <n-data-table
         :columns="columns"
         :data="list"
@@ -54,7 +54,7 @@ const columns: DataTableColumns<AlertRow> = [
       h(
         NTag,
         { type: row.severity === 'critical' ? 'error' : 'warning', size: 'small' },
-        { default: () => row.severity },
+        { default: () => (row.severity === 'critical' ? '严重' : '警告') },
       ),
   },
   {

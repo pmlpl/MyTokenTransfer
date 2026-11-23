@@ -1,6 +1,6 @@
 <template>
   <div class="keys-page">
-    <PageHeader title="密钥管理" subtitle="API 密钥池 · 健康测试 · 备份导入导出">
+    <PageHeader title="密钥管理">
       <template #actions>
         <n-button @click="openExport">导出备份</n-button>
         <n-button @click="openImport">导入备份</n-button>
@@ -9,9 +9,6 @@
     </PageHeader>
 
     <DataCard>
-      <template #header>
-        <span class="card-title">密钥列表</span>
-      </template>
       <template #actions>
         <n-select
           v-model:value="filter.provider_id"
@@ -71,17 +68,17 @@
           />
         </n-form-item>
         <n-form-item label="账号">
-          <n-input v-model:value="form.account_label" placeholder="如 账号A / org-xxx" />
+          <n-input v-model:value="form.account_label" placeholder="账号A / org-xxx" />
         </n-form-item>
         <n-form-item label="名称">
-          <n-input v-model:value="form.name" placeholder="便于识别的名字" />
+          <n-input v-model:value="form.name" />
         </n-form-item>
         <n-form-item label="密钥">
           <n-input
             v-model:value="form.key_value"
             type="password"
             show-password-on="click"
-            :placeholder="dialog.id ? '留空则不修改' : '明文密钥，落库前加密'"
+            :placeholder="dialog.id ? '留空则不修改' : ''"
           />
         </n-form-item>
         <n-form-item label="权重">
@@ -112,17 +109,20 @@
             v-model:value="bundleDialog.password"
             type="password"
             show-password-on="click"
-            :placeholder="bundleDialog.mode === 'export' ? '用于加密导出包（导入时需一致）' : '导出时设置的口令'"
           />
         </n-form-item>
         <n-form-item v-if="bundleDialog.mode === 'import'" label="备份文件">
           <input ref="fileInput" type="file" accept=".json" @change="onFilePick" />
         </n-form-item>
       </n-form>
-      <div class="hint-box">
-        导出包用该口令加密（口令不落库），包含全部供应商/分组/密钥明文，请妥善保管。<br />
-        导入按名称调谐：已存在同名密钥跳过，缺失的补建。
-      </div>
+      <n-alert
+        v-if="bundleDialog.mode === 'export'"
+        type="warning"
+        :bordered="false"
+        style="margin-top: 12px"
+      >
+        导出包含全部密钥明文，口令不落库。
+      </n-alert>
       <template #footer>
         <div style="display: flex; justify-content: flex-end; gap: 8px">
           <n-button @click="bundleDialog.visible = false">取消</n-button>
@@ -138,7 +138,7 @@
 <script setup lang="ts">
 import { computed, h, reactive, ref, onMounted } from 'vue'
 import {
-  NButton, NDataTable, NInput, NInputNumber, NSelect, NForm, NFormItem,
+  NAlert, NButton, NDataTable, NInput, NInputNumber, NSelect, NForm, NFormItem,
   NModal, NPopconfirm, NTag, useMessage, useDialog,
   type DataTableColumns, type SelectOption,
 } from 'naive-ui'
@@ -367,7 +367,7 @@ async function onTest(row: KeyRow) {
     if (r.ok && r.state_changed) {
       message.success('测试通过，状态已恢复')
     } else if (r.ok && !r.state_changed) {
-      message.warning('探测通过但仍在冷却/保护期，状态暂未变更（1-token 请求无法验证大请求是否限流）')
+      message.warning('测试通过，仍在冷却保护期')
     } else {
       message.error(`失败：${r.error || ''}`)
     }
@@ -489,7 +489,7 @@ async function onBundleSubmit() {
       a.download = `mytokentransfer-backup-${new Date().toISOString().slice(0, 10)}.json`
       a.click()
       URL.revokeObjectURL(url)
-      message.success('已导出（请妥善保管文件与口令）')
+      message.success('已导出')
     } else {
       if (!pickedBundle) {
         message.warning('请先选择备份文件')
@@ -522,15 +522,5 @@ onMounted(async () => {
   display: flex;
   flex-direction: column;
   gap: 16px;
-}
-.card-title {
-  font-size: 15px;
-  font-weight: 600;
-  color: var(--app-text-primary, #0f172a);
-}
-.hint-box {
-  color: var(--app-text-secondary, #64748b);
-  font-size: 12px;
-  line-height: 1.6;
 }
 </style>

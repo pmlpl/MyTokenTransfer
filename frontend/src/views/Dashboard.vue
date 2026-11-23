@@ -1,6 +1,6 @@
 <template>
   <div class="dashboard">
-    <PageHeader title="仪表盘" subtitle="密钥与转发整体概览" />
+    <PageHeader title="仪表盘" />
 
     <!-- KPI 条：4 张卡 -->
     <div class="kpi-grid">
@@ -19,7 +19,11 @@
         :single-line="false"
         size="small"
       />
-      <EmptyState v-if="!statusRows.length" title="暂无密钥" description="去密钥管理添加第一条 API 密钥" />
+      <EmptyState v-if="!statusRows.length" title="暂无密钥">
+        <template #actions>
+          <n-button size="small" type="primary" @click="router.push('/keys')">新增密钥</n-button>
+        </template>
+      </EmptyState>
     </DataCard>
 
     <!-- 密钥×模型 细粒度状态 -->
@@ -29,7 +33,7 @@
           <n-select
             v-model:value="selectedChannelId"
             :options="channelOptions"
-            placeholder="选择渠道按模型探测"
+            placeholder="选择渠道"
             clearable
             size="small"
             style="width: 200px"
@@ -64,8 +68,7 @@
       />
       <EmptyState
         v-if="!kmsLoading && !displayKmsItems.length"
-        title="暂无模型级状态记录"
-        description="选择渠道点击「按渠道测试」，或密钥在实际请求后会自动生成各模型的独立状态"
+        title="暂无模型级状态"
       />
     </DataCard>
   </div>
@@ -73,6 +76,7 @@
 
 <script setup lang="ts">
 import { computed, h, onMounted, ref } from 'vue'
+import { useRouter } from 'vue-router'
 import { NButton, NDataTable, NSelect, NTag, type DataTableColumns } from 'naive-ui'
 import { api, type Channel, type KeyModelStatusItem } from '@/api'
 import { tokens } from '@/design/tokens'
@@ -81,6 +85,8 @@ import KpiCard from '@/design/components/KpiCard.vue'
 import DataCard from '@/design/components/DataCard.vue'
 import EmptyState from '@/design/components/EmptyState.vue'
 import StatusDot from '@/design/components/StatusDot.vue'
+
+const router = useRouter()
 
 const stats = ref<{ providers: number; keys: number; active: number; by_status: Record<string, number> }>({
   providers: 0,

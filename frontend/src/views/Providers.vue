@@ -1,12 +1,12 @@
 <template>
   <div class="providers-page">
-    <PageHeader title="供应商" subtitle="API 厂商 · 模型列表 · 探测方式">
+    <PageHeader title="供应商">
       <template #actions>
         <n-button type="primary" @click="openAdd">新增供应商</n-button>
       </template>
     </PageHeader>
 
-    <DataCard title="供应商列表">
+    <DataCard>
       <n-data-table
         :columns="columns"
         :data="list"
@@ -27,10 +27,10 @@
     >
       <n-form :model="form" label-placement="left" label-width="90">
         <n-form-item label="名称">
-          <n-input v-model:value="form.name" placeholder="如 OpenAI" />
+          <n-input v-model:value="form.name" placeholder="OpenAI" />
         </n-form-item>
         <n-form-item label="slug">
-          <n-input v-model:value="form.slug" placeholder="openai / anthropic / gemini" />
+          <n-input v-model:value="form.slug" placeholder="openai" />
         </n-form-item>
         <n-form-item label="Base URL">
           <n-input v-model:value="form.base_url" placeholder="留空用默认" />
@@ -43,7 +43,7 @@
             v-model:value="form.models_text"
             type="textarea"
             :rows="4"
-            placeholder="每行一个模型名，如：&#10;SenseNova-V6.5-Turbo&#10;SenseChat-5"
+            placeholder="每行一个模型名"
           />
         </n-form-item>
         <n-form-item label="备注">
@@ -80,6 +80,15 @@ const probeOptions: SelectOption[] = [
   { label: 'Gemini /v1beta/models', value: 'gemini_models' },
 ]
 
+const PROBE_LABELS: Record<string, string> = {
+  openai_models: 'OpenAI',
+  anthropic: 'Anthropic',
+  gemini_models: 'Gemini',
+}
+function probeLabel(kind: string): string {
+  return PROBE_LABELS[kind] ?? kind
+}
+
 const dialog = reactive<{ visible: boolean; id: number | null; saving: boolean }>({
   visible: false,
   id: null,
@@ -105,7 +114,12 @@ const columns: DataTableColumns<Provider> = [
   { title: '名称', key: 'name', width: 120 },
   { title: 'slug', key: 'slug', width: 120 },
   { title: 'Base URL', key: 'base_url', minWidth: 220 },
-  { title: '探测方式', key: 'probe_kind', width: 150 },
+  {
+    title: '探测方式',
+    key: 'probe_kind',
+    width: 150,
+    render: (row) => probeLabel(row.probe_kind),
+  },
   {
     title: '模型数',
     key: 'models_count',

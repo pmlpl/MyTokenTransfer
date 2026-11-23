@@ -13,34 +13,37 @@
         <span class="logo-text">MyTokenTransfer</span>
       </div>
       <n-menu
+        class="sidebar-menu"
         :value="activeKey"
         :options="menuOptions"
         :inverted="true"
         :indent="18"
         @update:value="onMenuSelect"
       />
+      <!-- 全局操作收进侧栏底部：页面标题因此只需出现一次 -->
+      <div class="sidebar-foot">
+        <n-badge :value="unresolved" :max="99" :show="unresolved > 0">
+          <n-tooltip trigger="hover" placement="right">
+            <template #trigger>
+              <n-button quaternary circle aria-label="告警事件" @click="goAlerts">
+                <template #icon><n-icon :component="NotificationsIcon" /></template>
+              </n-button>
+            </template>
+            告警事件
+          </n-tooltip>
+        </n-badge>
+        <n-tooltip trigger="hover" placement="right">
+          <template #trigger>
+            <n-button quaternary circle aria-label="退出登录" @click="onLogout">
+              <template #icon><n-icon :component="LogOutIcon" /></template>
+            </n-button>
+          </template>
+          退出登录
+        </n-tooltip>
+      </div>
     </n-layout-sider>
 
     <n-layout>
-      <!-- 顶栏 -->
-      <n-layout-header bordered class="header">
-        <div class="header-left">
-          <span class="page-title">{{ currentPageTitle }}</span>
-        </div>
-        <div class="header-right">
-          <n-badge :value="unresolved" :max="99" :show="unresolved > 0">
-            <n-button quaternary circle @click="goAlerts">
-              <template #icon><n-icon :component="NotificationsIcon" /></template>
-            </n-button>
-          </n-badge>
-          <n-button quaternary @click="onLogout">
-            <template #icon><n-icon :component="LogOutIcon" /></template>
-            退出登录
-          </n-button>
-        </div>
-      </n-layout-header>
-
-      <!-- 内容区 -->
       <n-layout-content class="content" :native-scrollbar="false">
         <router-view />
       </n-layout-content>
@@ -54,12 +57,12 @@ import { useRoute, useRouter } from 'vue-router'
 import {
   NLayout,
   NLayoutSider,
-  NLayoutHeader,
   NLayoutContent,
   NMenu,
   NBadge,
   NButton,
   NIcon,
+  NTooltip,
   type MenuOption,
 } from 'naive-ui'
 import {
@@ -103,10 +106,6 @@ const NotificationsIcon = NotificationsOutline
 const LogOutIcon = LogOutOutline
 
 const activeKey = computed(() => route.path)
-const currentPageTitle = computed(() => {
-  const found = menuOptions.find((m) => m.key === route.path)
-  return found?.label || 'MyTokenTransfer'
-})
 
 function onMenuSelect(key: string) {
   router.push(key)
@@ -147,6 +146,9 @@ onUnmounted(() => {
 }
 :deep(.sidebar-scroll) {
   background: v-bind('tokens.light.sidebar');
+  display: flex;
+  flex-direction: column;
+  height: 100%;
 }
 .logo {
   display: flex;
@@ -154,6 +156,7 @@ onUnmounted(() => {
   gap: 8px;
   padding: 18px 20px;
   color: #fff;
+  flex-shrink: 0;
 }
 .logo-mark {
   display: block;
@@ -171,23 +174,25 @@ onUnmounted(() => {
   font-weight: 600;
   letter-spacing: 0.5px;
 }
-.header {
+.sidebar-menu {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+.sidebar-foot {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  padding: 0 24px;
-  height: 56px;
-  background: var(--app-card-bg, #fff);
+  gap: 4px;
+  padding: 10px 14px;
+  border-top: 1px solid rgba(148, 163, 184, 0.18);
+  flex-shrink: 0;
 }
-.page-title {
-  font-size: 16px;
-  font-weight: 600;
-  color: var(--app-text-primary, #0f172a);
+.sidebar-foot :deep(.n-button) {
+  color: #94a3b8;
 }
-.header-right {
-  display: flex;
-  align-items: center;
-  gap: 8px;
+.sidebar-foot :deep(.n-button:hover) {
+  color: #fff;
+  background: rgba(255, 255, 255, 0.08);
 }
 .content {
   padding: 24px;

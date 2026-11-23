@@ -1,6 +1,6 @@
 <template>
   <div class="pricing-page">
-    <PageHeader title="模型价格 & 用量" subtitle="按模型维度统计调用与成本 · 价格请在下方手动录入/维护">
+    <PageHeader title="模型价格">
       <template #actions>
         <n-radio-group v-model:value="days" @update:value="loadUsageStats">
           <n-radio-button :value="7">近 7 天</n-radio-button>
@@ -13,20 +13,17 @@
 
     <!-- 模型用量柱状统计 -->
     <div class="charts-grid">
-      <DataCard title="模型调用次数（Top N）">
+      <DataCard title="模型调用次数">
         <v-chart v-if="callsOpt" :option="callsOpt" autoresize style="height: 280px" />
-        <EmptyState v-else title="暂无数据" description="该时间范围内还没有调用记录" />
+        <EmptyState v-else title="该时间段无调用记录" />
       </DataCard>
       <DataCard title="模型累计成本">
         <v-chart v-if="costOpt" :option="costOpt" autoresize style="height: 280px" />
-        <EmptyState v-else title="暂无数据" description="需要先录入模型价格，或该时间范围无调用" />
+        <EmptyState v-else title="尚无成本数据" />
       </DataCard>
     </div>
 
-    <DataCard title="本地价格列表">
-      <template #actions>
-        <n-tag v-if="list.length" size="small" type="info" round>共 {{ list.length }} 条</n-tag>
-      </template>
+    <DataCard>
       <n-data-table
         :columns="columns"
         :data="list"
@@ -47,7 +44,7 @@
     >
       <n-form :model="form" label-placement="left" label-width="110">
         <n-form-item label="模型名">
-          <n-input v-model:value="form.model_name" :disabled="!!dialog.id" placeholder="如 glm-5.2" />
+          <n-input v-model:value="form.model_name" :disabled="!!dialog.id" placeholder="glm-5.2" />
         </n-form-item>
         <n-form-item label="输入价/1M">
           <n-input-number v-model:value="form.input_price" :min="0" :step="0.1" :precision="6" style="width: 100%" />
@@ -58,20 +55,40 @@
         <n-form-item label="输出价/1M">
           <n-input-number v-model:value="form.output_price" :min="0" :step="0.1" :precision="6" style="width: 100%" />
         </n-form-item>
-        <n-form-item label="空闲输入价/1M">
-          <n-input-number v-model:value="form.off_peak_input_price" :min="0" :step="0.1" :precision="6" style="width: 100%" placeholder="0=沿用标准价" />
-        </n-form-item>
-        <n-form-item label="空闲输出价/1M">
-          <n-input-number v-model:value="form.off_peak_output_price" :min="0" :step="0.1" :precision="6" style="width: 100%" placeholder="0=沿用标准价" />
-        </n-form-item>
-        <n-form-item label=" ">
-          <span style="font-size: 12px; color: var(--n-text-color-3, #999)">高峰时段为周一至周五 9:00–12:00、14:00–18:00（北京时间），其余时间按空闲价计费；无分时定价的模型保持 0 即可</span>
+        <n-form-item>
+          <template #label>
+            <span class="group-label">
+              空闲价/1M
+              <n-tooltip trigger="hover">
+                <template #trigger>
+                  <n-icon :component="HelpCircleOutline" :size="14" />
+                </template>
+                高峰为周一至周五 9:00–12:00、14:00–18:00（北京时间），其余按空闲价计费。不区分时段填 0。
+              </n-tooltip>
+            </span>
+          </template>
+          <div class="dual-input">
+            <n-input-number
+              v-model:value="form.off_peak_input_price"
+              :min="0"
+              :step="0.1"
+              :precision="6"
+              placeholder="输入 0"
+            />
+            <n-input-number
+              v-model:value="form.off_peak_output_price"
+              :min="0"
+              :step="0.1"
+              :precision="6"
+              placeholder="输出 0"
+            />
+          </div>
         </n-form-item>
         <n-form-item label="币种">
           <n-select v-model:value="form.currency" :options="currencyOptions" />
         </n-form-item>
         <n-form-item label="上下文长度">
-          <n-input-number v-model:value="form.context_length" :min="0" :step="1024" style="width: 100%" placeholder="0=未设置，如 1048576" />
+          <n-input-number v-model:value="form.context_length" :min="0" :step="1024" style="width: 100%" placeholder="未设置" />
         </n-form-item>
         <n-form-item label="备注">
           <n-input v-model:value="form.note" />
@@ -95,10 +112,11 @@ import { BarChart } from 'echarts/charts'
 import { GridComponent, TooltipComponent } from 'echarts/components'
 import VChart from 'vue-echarts'
 import {
-  NButton, NDataTable, NInput, NInputNumber, NSelect, NForm, NFormItem,
-  NModal, NPopconfirm, NTag, NRadioGroup, NRadioButton,
+  NButton, NDataTable, NIcon, NInput, NInputNumber, NSelect, NForm, NFormItem,
+  NModal, NPopconfirm, NTooltip, NRadioGroup, NRadioButton,
   useMessage, type DataTableColumns, type SelectOption,
 } from 'naive-ui'
+import { HelpCircleOutline } from '@vicons/ionicons5'
 import { api, type Pricing, type UsageResp } from '@/api'
 import PageHeader from '@/design/components/PageHeader.vue'
 import DataCard from '@/design/components/DataCard.vue'
@@ -144,38 +162,38 @@ function fmtContext(n: number): string {
 }
 
 const columns: DataTableColumns<Pricing> = [
-  { title: '模型', key: 'model_name', minWidth: 200 },
+  { title: '模型', key: 'model_name', minWidth: 190 },
   {
     title: '输入价 / 1M',
     key: 'input_price',
-    width: 150,
+    width: 120,
     render: (row) => `${row.input_price} ${row.currency}`,
   },
   {
     title: '缓存命中价 / 1M',
     key: 'cached_input_price',
-    width: 150,
+    width: 130,
     render: (row) => `${row.cached_input_price} ${row.currency}`,
   },
   {
     title: '输出价 / 1M',
     key: 'output_price',
-    width: 150,
+    width: 120,
     render: (row) => `${row.output_price} ${row.currency}`,
   },
   {
     title: '空闲档 / 1M',
     key: 'off_peak_prices',
-    width: 180,
+    width: 150,
     render: (row) => fmtOffPeak(row),
   },
   {
     title: '上下文',
     key: 'context_length',
-    width: 120,
+    width: 100,
     render: (row) => fmtContext(row.context_length),
   },
-  { title: '备注', key: 'note', minWidth: 220 },
+  { title: '备注', key: 'note', minWidth: 185, ellipsis: { tooltip: true } },
   {
     title: '操作',
     key: 'actions',
@@ -225,7 +243,7 @@ const callsOpt = computed(() => {
   if (!rows.length) return null
   return {
     tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' }, valueFormatter: (v: number) => `${v.toLocaleString()} 次` },
-    grid: { left: 72, right: 16, top: 20, bottom: 48 },
+    grid: { left: 72, right: 16, top: 36, bottom: 48 },
     xAxis: {
       type: 'category',
       data: rows.map((r) => r.model),
@@ -256,7 +274,7 @@ const costOpt = computed(() => {
       axisPointer: { type: 'shadow' },
       valueFormatter: (v: number) => `${Number(v).toLocaleString(undefined, { maximumFractionDigits: 4 })} 元`,
     },
-    grid: { left: 72, right: 16, top: 20, bottom: 48 },
+    grid: { left: 72, right: 16, top: 36, bottom: 48 },
     xAxis: {
       type: 'category',
       data: rows.map((r) => r.model),
@@ -354,6 +372,22 @@ onMounted(() => {
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 16px;
+}
+.group-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--app-text-secondary, #64748b);
+  cursor: help;
+}
+.dual-input {
+  display: flex;
+  gap: 8px;
+  width: 100%;
+}
+.dual-input :deep(.n-input-number) {
+  flex: 1;
+  min-width: 0;
 }
 @media (max-width: 960px) {
   .charts-grid {

@@ -1,52 +1,55 @@
 <template>
   <div class="playground-page">
-    <PageHeader title="Playground" subtitle="网关接入信息 · 端到端调试" />
+    <PageHeader title="Playground" />
 
-    <DataCard title="网关接入信息" subtitle="给任意 OpenAI 兼容客户端用">
+    <DataCard title="网关接入">
       <div class="info-line">
-        <span class="k">固定地址</span>
+        <span class="k">
+          <n-tag size="small" type="success" :bordered="false">固定</n-tag>
+        </span>
         <code class="url-code">{{ fixedUrl }}</code>
-        <n-button size="small" quaternary @click="copy(fixedUrl)">
+        <n-button size="small" quaternary aria-label="复制固定地址" @click="copy(fixedUrl)">
           <template #icon><n-icon :component="CopyOutline" /></template>
         </n-button>
-        <span class="hint">跨网络可用，其他设备接入 Tailscale 后使用（推荐）</span>
       </div>
       <div class="info-line">
-        <span class="k">本机地址</span>
+        <span class="k">
+          <n-tag size="small" :bordered="false">本机</n-tag>
+        </span>
         <code class="url-code">{{ baseUrl }}/v1</code>
-        <n-button size="small" quaternary @click="copy(`${baseUrl}/v1`)">
+        <n-button size="small" quaternary aria-label="复制本机地址" @click="copy(`${baseUrl}/v1`)">
           <template #icon><n-icon :component="CopyOutline" /></template>
         </n-button>
-        <span class="hint">仅当前网络入口，地址会随网络变化</span>
       </div>
       <div class="info-line">
         <span class="k">API Key</span>
         <code>{{ gwToken || '加载中…' }}</code>
-        <n-button size="small" quaternary @click="copy(gwToken)">
+        <n-button size="small" quaternary aria-label="复制 API Key" @click="copy(gwToken)">
           <template #icon><n-icon :component="CopyOutline" /></template>
         </n-button>
       </div>
       <div class="info-line">
-        <span class="k">鉴权方式</span>
+        <span class="k">鉴权</span>
         <code>Authorization: Bearer &lt;API Key&gt;</code>
       </div>
       <div class="info-line">
-        <span class="k">可用模型</span>
-        <n-select
-          v-model:value="selModel"
-          :options="modelOptions"
-          placeholder="选择模型"
-          style="width: 280px"
-          @update:value="onModelSelect"
-        />
-        <n-button size="small" quaternary @click="copy(selModel)" :disabled="!selModel">
-          <template #icon><n-icon :component="CopyOutline" /></template>
-        </n-button>
-        <span v-if="!models.length" class="hint">（先到"转发通道"页创建通道）</span>
+        <span class="k">模型</span>
+        <template v-if="models.length">
+          <n-select
+            v-model:value="selModel"
+            :options="modelOptions"
+            style="width: 280px"
+            @update:value="onModelSelect"
+          />
+          <n-button size="small" quaternary aria-label="复制模型名" @click="copy(selModel)" :disabled="!selModel">
+            <template #icon><n-icon :component="CopyOutline" /></template>
+          </n-button>
+        </template>
+        <n-button v-else size="small" @click="$router.push('/channels')">创建通道</n-button>
       </div>
     </DataCard>
 
-    <DataCard title="Playground · 端到端调试" subtitle="经统一网关调用，计入日志与用量">
+    <DataCard title="调试">
       <n-form inline label-placement="left" :show-feedback="false">
         <n-form-item label="模型">
           <n-select
@@ -64,11 +67,11 @@
         v-model:value="inputMessage"
         type="textarea"
         :rows="3"
-        placeholder="输入消息，如：用一句话介绍你自己"
+        placeholder="输入消息"
         style="margin-top: 12px"
       />
       <div style="margin-top: 12px">
-        <n-button type="primary" :loading="sending" @click="send">发送（经统一网关）</n-button>
+        <n-button type="primary" :loading="sending" @click="send">发送</n-button>
       </div>
 
       <div v-if="reply" class="reply">
@@ -80,8 +83,8 @@
         </div>
         <div class="reply-body">{{ reply }}</div>
         <div class="meta" v-if="lastLog">
-          本次由 key #{{ lastLog.key_id }}（T{{ lastLog.tier_order }} 层）服务 ·
-          <n-tag size="small" type="success">查看"调用日志"页可见完整记录</n-tag>
+          key #{{ lastLog.key_id }} · T{{ lastLog.tier_order }} 层 ·
+          <a class="log-link" @click="$router.push('/logs')">调用日志</a>
         </div>
       </div>
       <n-alert v-if="err" type="error" :show-icon="true" style="margin-top: 12px">
@@ -250,9 +253,9 @@ onMounted(async () => {
   word-break: break-all;
   white-space: normal;
 }
-.hint {
-  color: var(--app-text-secondary, #64748b);
-  font-size: 12px;
+.log-link {
+  color: var(--app-brand, #4f7cff);
+  cursor: pointer;
 }
 .reply {
   margin-top: 16px;

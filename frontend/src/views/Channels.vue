@@ -1,12 +1,12 @@
 <template>
   <div class="channels-page">
-    <PageHeader title="转发通道" subtitle="虚拟模型 · 多层 fallback · 策略调度">
+    <PageHeader title="转发通道">
       <template #actions>
         <n-button type="primary" @click="openAdd">新增通道</n-button>
       </template>
     </PageHeader>
 
-    <DataCard title="通道列表">
+    <DataCard>
       <n-data-table
         :columns="columns"
         :data="list"
@@ -28,13 +28,13 @@
       <n-form :model="form" label-placement="left" label-width="90">
         <div class="form-row">
           <n-form-item label="名称" :show-feedback="false" style="flex: 1">
-            <n-input v-model:value="form.name" placeholder="如 SenseNova 池" />
+            <n-input v-model:value="form.name" placeholder="SenseNova 池" />
           </n-form-item>
           <n-form-item label="虚拟模型" :show-feedback="false" style="flex: 1">
             <n-input
               v-model:value="form.virtual_model"
               :disabled="!!dialog.id"
-              placeholder="客户端请求里的 model 名"
+              placeholder="model"
             />
           </n-form-item>
         </div>
@@ -81,10 +81,12 @@
                   size="small"
                   style="width: 260px"
                 />
-                <n-input-number v-model:value="k.weight" :min="1" :max="100" size="small" style="width: 90px" />
-                <span class="hint">权重</span>
-                <n-input-number v-model:value="k.priority" :min="0" :max="100" size="small" style="width: 90px" />
-                <span class="hint">优先级</span>
+                <n-input-number v-model:value="k.weight" :min="1" :max="100" size="small" style="width: 110px">
+                  <template #prefix>权重</template>
+                </n-input-number>
+                <n-input-number v-model:value="k.priority" :min="0" :max="100" size="small" style="width: 100px">
+                  <template #prefix>优先</template>
+                </n-input-number>
                 <n-button size="small" quaternary type="error" @click="t.keys.splice(ki, 1)">删</n-button>
               </div>
               <n-button
@@ -100,7 +102,7 @@
               size="small"
               @click="form.tiers.push({ provider_id: undefined as unknown as number, keys: [] })"
             >
-              + 添加兜底层（跨供应商 fallback）
+              + 添加兜底层
             </n-button>
           </div>
         </n-form-item>
@@ -116,14 +118,14 @@
                 style="width: 200px"
               />
               <span class="hint">→</span>
-              <n-input v-model:value="m.native_model" placeholder="该供应商的原生模型名" size="small" style="width: 240px" />
+                <n-input v-model:value="m.native_model" placeholder="原生模型名" size="small" style="width: 240px" />
               <n-button size="small" quaternary type="error" @click="form.mappings.splice(mi, 1)">删</n-button>
             </div>
             <n-button
               size="small"
               @click="form.mappings.push({ provider_id: undefined as unknown as number, native_model: '' })"
             >
-              + 添加映射（虚拟模型在该供应商上的真实模型名）
+              + 添加模型映射
             </n-button>
           </div>
         </n-form-item>
@@ -210,13 +212,18 @@ const columns: DataTableColumns<Channel> = [
           h('div', { class: 'tier-line' }, [
             h(NTag, { size: 'small', type: t.order === 0 ? 'primary' : 'default', class: 'tier-tag' }, { default: () => `T${t.order}` }),
             h('span', null, t.provider_name),
-            h('span', { class: 'keys' }, `（${formatKeys(t.keys)}）`),
+            h('span', { class: 'keys' }, formatKeys(t.keys)),
           ]),
         ),
         !row.tiers?.length ? h('div', { class: 'keys' }, '未配置') : null,
       ]),
   },
-  { title: '策略', key: 'strategy', width: 110 },
+  {
+    title: '策略',
+    key: 'strategy',
+    width: 110,
+    render: (row) => strategyLabel(row.strategy),
+  },
   { title: '重试', key: 'max_retries', width: 60 },
   {
     title: '启用',
@@ -252,6 +259,9 @@ function formatKeys(keys: ChannelKeyItem[] | undefined): string {
 }
 function statusText(s: string) {
   return ({ active: '可用', rate_limited: '限流', exhausted: '耗尽', invalid: '失效', disabled: '停用' } as const)[s as 'active'] || s
+}
+function strategyLabel(s: string) {
+  return ({ round_robin: '轮询', weighted: '加权', priority: '优先级' } as const)[s as 'round_robin'] || s
 }
 
 async function load() {

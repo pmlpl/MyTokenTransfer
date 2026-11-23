@@ -4,14 +4,12 @@
       <div class="brand">
         <img class="brand-mark" src="/logo.png" alt="MTT" />
         <h2 class="brand-title">MyTokenTransfer</h2>
-        <p class="brand-sub">API 密钥管理台 · 本地登录</p>
       </div>
-      <n-form @submit.prevent="onLogin">
-        <n-form-item :show-label="false">
+      <n-form label-placement="top" @submit.prevent="onLogin">
+        <n-form-item label="主密码" :show-feedback="false">
           <n-input
             v-model:value="form.password"
             type="password"
-            placeholder="主密码"
             show-password-on="click"
             size="large"
             @keyup.enter="onLogin"
@@ -98,14 +96,9 @@ async function onLogin() {
   margin: 0 auto 12px;
 }
 .brand-title {
-  margin: 0 0 4px;
+  margin: 0;
   font-size: 20px;
   font-weight: 600;
   color: #0f172a;
-}
-.brand-sub {
-  margin: 0;
-  font-size: 13px;
-  color: #64748b;
 }
 </style>

@@ -9,7 +9,6 @@
       </slot>
     </div>
     <div class="title">{{ title }}</div>
-    <div v-if="description" class="desc">{{ description }}</div>
     <div v-if="$slots.actions" class="actions">
       <slot name="actions" />
     </div>
@@ -17,10 +16,10 @@
 </template>
 
 <script setup lang="ts">
-// v2 空状态：图标 + 标题 + 描述 + 可选操作按钮
+// 空状态：图标 + 一句说明 + 可选操作按钮。
+// 不要描述"为什么空/怎么修"——能一键修的就给按钮，说不清的是设计问题。
 defineProps<{
   title: string
-  description?: string
 }>()
 </script>
 
@@ -41,11 +40,6 @@ defineProps<{
   font-size: 15px;
   font-weight: 500;
   color: var(--app-text-primary, #0f172a);
-  margin-bottom: 4px;
-}
-.desc {
-  font-size: 13px;
-  color: var(--app-text-secondary, #64748b);
 }
 .actions {
   margin-top: 16px;

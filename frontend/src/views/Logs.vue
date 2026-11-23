@@ -1,8 +1,8 @@
 <template>
   <div class="logs-page">
-    <PageHeader title="调用日志" subtitle="网关转发记录 · 成功/失败 · token 与耗时" />
+    <PageHeader title="调用日志" />
 
-    <DataCard title="日志列表">
+    <DataCard>
       <template #actions>
         <n-select
           v-model:value="status"

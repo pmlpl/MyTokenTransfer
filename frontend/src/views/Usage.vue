@@ -1,6 +1,6 @@
 <template>
   <div class="usage-page">
-    <PageHeader title="用量统计" subtitle="调用次数 · Tokens · 成本 · 缓存命中">
+    <PageHeader title="用量统计">
       <template #actions>
         <n-radio-group v-model:value="days" @update:value="load">
           <n-radio-button :value="1">今日</n-radio-button>
@@ -13,36 +13,15 @@
       </template>
     </PageHeader>
 
-    <!-- KPI 卡片（带进度条） -->
+    <!-- KPI 条 -->
     <div class="kpi-grid">
-      <div class="kpi-wrap">
-        <KpiCard label="总调用次数" :value="totals.calls" />
-        <div class="kpi-progress">
-          <div class="kpi-progress-bar" :style="{ width: kpiProgress.calls + '%', background: '#4f7cff' }" />
-        </div>
-        <div class="kpi-progress-label">{{ kpiProgress.calls }}% · 峰值时段占比</div>
-      </div>
-      <div class="kpi-wrap">
-        <KpiCard label="总 Tokens" :value="totals.total_tokens" />
-        <div class="kpi-progress">
-          <div class="kpi-progress-bar" :style="{ width: kpiProgress.tokens + '%', background: '#6366f1' }" />
-        </div>
-        <div class="kpi-progress-label">{{ kpiProgress.tokens }}% · 峰值时段占比</div>
-      </div>
-      <div class="kpi-wrap">
-        <KpiCard label="缓存命中率" :value="totals.cache_hit_rate != null ? totals.cache_hit_rate + '%' : '—'" />
-        <div class="kpi-progress">
-          <div class="kpi-progress-bar" :style="{ width: (totals.cache_hit_rate ?? 0) + '%', background: hitColor(totals.cache_hit_rate ?? 0) }" />
-        </div>
-        <div class="kpi-progress-label" :style="{ color: hitColor(totals.cache_hit_rate ?? 0) }">{{ totals.cache_hit_rate ?? 0 }}% · 命中效率</div>
-      </div>
-      <div class="kpi-wrap">
-        <KpiCard label="总成本" :value="fmtCost(totals.cost)" :suffix="currency" />
-        <div class="kpi-progress">
-          <div class="kpi-progress-bar" :style="{ width: kpiProgress.cost + '%', background: '#10b981' }" />
-        </div>
-        <div class="kpi-progress-label">{{ kpiProgress.cost }}% · 峰值时段占比</div>
-      </div>
+      <KpiCard label="总调用次数" :value="totals.calls" />
+      <KpiCard label="总 Tokens" :value="totals.total_tokens" />
+      <KpiCard
+        label="缓存命中率"
+        :value="totals.cache_hit_rate != null ? totals.cache_hit_rate + '%' : '—'"
+      />
+      <KpiCard label="总成本" :value="fmtCost(totals.cost)" :suffix="currency" />
     </div>
 
     <!-- 趋势分析：维度切换（segment 放卡片头 flex 槽会宽度塌陷，故置于内容区顶部） -->
@@ -64,7 +43,7 @@
         </n-radio-group>
       </div>
       <v-chart v-if="trendOpt" :option="trendOpt" autoresize style="height: 360px" />
-      <EmptyState v-else title="无数据" description="该时间范围内无调用记录" />
+      <EmptyState v-else title="该时间段无调用记录" />
     </DataCard>
 
     <!-- 用量明细：按密钥 / 按模型 Tab 切换 -->
@@ -86,7 +65,7 @@
           size="small"
           :row-key="(row: any) => row.key_id ?? row.key_name"
         />
-        <EmptyState v-else title="无数据" description="该时间范围内无调用记录" />
+        <EmptyState v-else title="该时间段无调用记录" />
       </template>
 
       <!-- 按模型 -->
@@ -99,7 +78,7 @@
           size="small"
           :row-key="(row: any) => row.model"
         />
-        <EmptyState v-else title="无数据" description="该时间范围内无调用记录" />
+        <EmptyState v-else title="该时间段无调用记录" />
       </template>
     </DataCard>
   </div>
@@ -153,25 +132,6 @@ const MODEL_COLORS = ['#4f7cff', '#10b981', '#f59e0b', '#ef4444', '#6366f1', '#e
 function modelColor(model: string, index: number): string {
   return MODEL_COLORS[index % MODEL_COLORS.length]
 }
-
-// KPI 进度条：当前值占理论最大值（峰值时段 × 总时段数）的比例
-const kpiProgress = computed(() => {
-  const isToday = days.value === 1
-  const allRows = isToday ? (data.value?.hourly ?? []) : (data.value?.daily ?? [])
-  // 波形已改为滚动 24 小时窗口，今日口径的分母只统计属于今天的桶
-  const rows = isToday ? allRows.filter((r: any) => r.is_today !== false) : allRows
-  if (!rows.length) return { calls: 0, tokens: 0, cost: 0 }
-
-  const totalSlots = isToday ? 24 : days.value
-  const peakCalls = Math.max(...rows.map((r: any) => r.calls), 1)
-  const peakTokens = Math.max(...rows.map((r: any) => r.total_tokens), 1)
-  const peakCost = Math.max(...rows.map((r: any) => r.cost), 0.0001)
-
-  const calls = Math.min(100, Math.round((totals.value.calls / (peakCalls * totalSlots)) * 100))
-  const tokens = Math.min(100, Math.round((totals.value.total_tokens / (peakTokens * totalSlots)) * 100))
-  const cost = Math.min(100, Math.round((totals.value.cost / (peakCost * totalSlots)) * 100))
-  return { calls, tokens, cost }
-})
 
 // 按密钥表格列
 const keyColumns: DataTableColumns<any> = [
@@ -562,33 +522,6 @@ onMounted(load)
   .kpi-grid {
     grid-template-columns: repeat(2, 1fr);
   }
-}
-.kpi-wrap {
-  display: flex;
-  flex-direction: column;
-  gap: 0;
-}
-.kpi-wrap :deep(.kpi-card) {
-  border-radius: 12px 12px 0 0;
-  border-bottom: none;
-}
-.kpi-progress {
-  background: var(--app-card-bg, #fff);
-  border: 1px solid var(--app-border, #e5e7eb);
-  border-top: none;
-  border-radius: 0 0 12px 12px;
-  padding: 0 24px 10px;
-}
-.kpi-progress-bar {
-  height: 5px;
-  border-radius: 3px;
-  transition: width 0.4s ease;
-}
-.kpi-progress-label {
-  font-size: 11px;
-  color: var(--app-text-tertiary, #94a3b8);
-  margin-top: 5px;
-  font-variant-numeric: tabular-nums;
 }
 .detail-tabs {
   margin-left: auto;
